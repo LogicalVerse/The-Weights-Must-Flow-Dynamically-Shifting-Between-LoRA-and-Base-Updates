@@ -365,16 +365,6 @@ All Tier 0 and Tier 3 configurations are evaluated across three seeds (8, 25, 42
 
 ---
 
-## Known Limitations
-
-- **Switching mode:** The current `AutoModeController` implements only `switching_mode="percentile"` thresholding. The `topk_fixed`, `gumbel`, and `static` options are reserved in the configuration schema (`SwitchingMode` enum) but raise `NotImplementedError` if selected. The `GumbelGate` module in `core.py` is a forward-looking preview and is not reachable through any runnable method in the current codebase.
-- **Promotion scope:** Promotion and demotion operate on the modules specified in `lora_target_modules` (default: `q_proj`, `v_proj`). Other projections (e.g., `k_proj`, `o_proj`, MLP projections) are not currently candidates for mode switching.
-- **Approximate baselines:** `lisa`, `adagradselect`, and `loraga` are labeled `approximate` in `METHOD_FIDELITY`. They should not be used as primary headline comparisons without reviewing the documented deviations from the original papers.
-- **`loraga`** falls back to standard LoRA initialization if the gradient-aligned initialization fork is not installed; the fallback is silent unless verbose logging is enabled.
-- **Single-seed Tier 1 runs** (cross-architecture generalization) should be interpreted as directional evidence, not statistically rigorous comparisons.
-
----
-
 ## Citation
 
 If you use this code, please cite:
