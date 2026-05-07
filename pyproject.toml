@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "automode"
+version = "0.1.0"
+description = "Dynamic per-layer switching between LoRA and Full-FT for LLM fine-tuning"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1",
+    "transformers>=4.41",
+    "peft>=0.11",
+    "datasets>=2.19",
+    "accelerate>=0.30",
+    "tqdm",
+    "numpy",
+    "pandas",
+    "scipy",
+    "matplotlib",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+bnb = ["bitsandbytes"]   # optional: 8-bit Adam for Full-FT on tight VRAM
+
+[tool.setuptools.packages.find]
+include = ["automode*"]
+exclude = ["tests*", "notebooks*", "runs*"]
