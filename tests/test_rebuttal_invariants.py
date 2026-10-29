@@ -702,6 +702,7 @@ def _fake_source(tmp_path, manifest_sha, commit="a" * 40):
 
 
 def test_cli_rejects_mismatched_source_and_foreign_output_dirs(tmp_path, monkeypatch):
+    monkeypatch.setenv("AUTOMODE_CODE_COMMIT", "a" * 40)
     _, sha = rebuttal.load_manifest(MANIFEST)
     out = tmp_path / "out"
     args = ["--manifest", str(MANIFEST), "--worker-id", "0", "--output", str(out)]
@@ -715,6 +716,7 @@ def test_cli_rejects_mismatched_source_and_foreign_output_dirs(tmp_path, monkeyp
     assert rebuttal.main(["run", *args, "--hours", "1"]) != 0
 
     monkeypatch.setenv("AUTOMODE_SOURCE_METADATA", str(_fake_source(tmp_path, sha, commit="b" * 40)))
+    monkeypatch.setenv("AUTOMODE_CODE_COMMIT", "b" * 40)
     before = (out / "pilot_report.json").read_text()
     assert rebuttal.main(["pilot", *args]) == 2  # DIR belongs to commit aaaa...: refuse, write nothing
     assert (out / "pilot_report.json").read_text() == before
