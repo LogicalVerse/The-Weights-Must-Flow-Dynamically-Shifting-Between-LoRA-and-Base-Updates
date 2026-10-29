@@ -18,7 +18,10 @@ Per-GPU sharding
 ----------------
 Each of the three GPUs gets a deterministic slice of the pending runs via
 int(run_id, 16) % n_gpus == gpu_rank — stable across processes because
-run_id() is MD5 hex. This means the three driver notebooks can
+run_id() is SHA-256 hex.
+
+LEGACY: this tiered grid is preserved for reference and is NOT part of the
+AAAI-27 rebuttal campaign (see automode/rebuttal.py and README). This means the three driver notebooks can
 run independently without coordination — each GPU just claims its slice.
 """
 
@@ -423,7 +426,7 @@ def shard_grid_by_gpu(
 
     (2) By stable hash (fallback when assignment is None):
           gpu_rank gets all runs where int(run_id, 16) % n_gpus == gpu_rank.
-          Uses the MD5-derived run_id (already hex) rather than Python's
+          Uses the SHA-256-derived run_id (already hex) rather than Python's
           built-in hash(), which is process-randomized unless PYTHONHASHSEED
           is set — the latter would put the same run on different GPUs
           across restarts and break resume behavior.
@@ -434,7 +437,7 @@ def shard_grid_by_gpu(
     if assignment is not None:
         mine = [c for c in grid if assignment.get(c.model_name, 0) == gpu_rank]
     else:
-        # Stable across processes and machines: run_id is MD5 hex (12 chars).
+        # Stable across processes and machines: run_id is SHA-256 hex (16 chars).
         mine = [c for c in grid if (int(c.run_id(), 16) % n_gpus) == gpu_rank]
     return mine
 
@@ -463,8 +466,10 @@ def run_grid(
     verbose: bool = True,
 ) -> List[dict]:
     """
-    Execute a list of configs sequentially. Resume-safe (skips completed runs).
-    Appends each result to csv_path as it completes so partial progress is preserved.
+    LEGACY grid runner (not used by the rebuttal campaign). Executes configs
+    sequentially and appends each result row to csv_path. A run is skipped only
+    when its COMPLETE marker verifies for the exact run_id and config; CSV rows
+    are a report, never evidence of completion.
     """
     import pandas as pd
     from automode.train import run_experiment, is_run_complete
@@ -472,18 +477,12 @@ def run_grid(
 
     results = []
 
-    # Load existing CSV if present
-    completed_ids = set()
     if csv_path and Path(csv_path).exists():
-        df = pd.read_csv(csv_path)
-        completed_ids = set(df["run_id"].tolist())
-        results = df.to_dict("records")
-        if verbose:
-            print(f"[resume] loaded {len(completed_ids)} completed rows from {csv_path}")
+        results = pd.read_csv(csv_path).to_dict("records")
 
     for i, cfg in enumerate(configs):
         rid = cfg.run_id()
-        if rid in completed_ids or is_run_complete(cfg):
+        if is_run_complete(cfg):
             if verbose:
                 print(f"[{i+1}/{len(configs)}] skip {rid} ({cfg.variant_label()})")
             continue

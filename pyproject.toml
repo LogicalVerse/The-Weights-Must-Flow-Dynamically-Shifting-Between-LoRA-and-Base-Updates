@@ -4,19 +4,23 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "automode"
-version = "0.1.0"
+version = "0.3.0"
 description = "Dynamic per-layer switching between LoRA and Full-FT for LLM fine-tuning"
 requires-python = ">=3.10"
+# Loose ranges for development. The rebuttal campaign installs the exact,
+# tested closure in requirements-rebuttal.lock (torch comes from the GPU image;
+# see RUNTIME.md) and then `pip install --no-deps -e .`.
 dependencies = [
     "torch>=2.1",
-    "transformers>=4.41",
-    "peft>=0.11",
+    "transformers>=4.42,<5",
+    "peft>=0.13,<0.16",
     "datasets>=2.19",
     "accelerate>=0.30",
+    "huggingface_hub",
+    "safetensors",
     "tqdm",
     "numpy",
     "pandas",
-    "scipy",
     "matplotlib",
 ]
 

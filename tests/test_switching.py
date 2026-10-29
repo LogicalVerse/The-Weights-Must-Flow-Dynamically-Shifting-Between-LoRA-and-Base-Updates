@@ -377,8 +377,9 @@ class TestControllerIntegration(unittest.TestCase):
         self.assertEqual(ctrl.update_interval, 10)
 
     def test_controller_end_to_end_switch(self):
+        # total=4, u=2 -> interval=2; one decision at step 2. Step 4 is the
+        # final update and AutoMode no longer switches after the last update.
         ctrl = AutoModeController(self.cfg, total_optimizer_steps=4)
-        # With total=4 and u=2, interval=2
         ctrl.attach(self.model)
 
         # Simulate training: forward -> backward -> accumulate -> switch
@@ -389,7 +390,7 @@ class TestControllerIntegration(unittest.TestCase):
         for opt_step in range(1, 5):
             out = self.model(input_ids, labels=labels)
             out["loss"].backward()
-            ctrl.on_micro_step(self.model)
+            ctrl.on_optimizer_step(self.model)  # default score_collection='optimizer_step'
             for p in self.model.parameters():
                 if p.grad is not None:
                     p.grad = None
@@ -397,12 +398,11 @@ class TestControllerIntegration(unittest.TestCase):
             trainable, _ = count_trainable_params(self.model)
             trainable_snapshots.append((opt_step, changed, trainable))
 
-        # Switches should have fired at steps 2 and 4 (multiples of interval=2)
-        # NEW:
+        # Decision at step 2 (interval=2); none at 4, the final update.
         decision_steps = [h["step"] for h in ctrl.switch_history]
         self.assertEqual(
-            decision_steps, [2, 4],
-            f"Expected switching decisions at [2, 4], got {decision_steps}"
+            decision_steps, [2],
+            f"Expected a switching decision at [2], got {decision_steps}"
         )
 
         trainable_counts = [t for _, _, t in trainable_snapshots]

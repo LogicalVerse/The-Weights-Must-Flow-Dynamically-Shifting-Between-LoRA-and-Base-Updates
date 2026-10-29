@@ -73,7 +73,34 @@ METHODS = frozenset({
     "lisa",             # LISA-style random full-parameter updates (keeps embed+head)
     "adagradselect",    # AdaGradSelect-style gradient-guided block selection
     "dyn_full_only",    # AutoMode controller but non-selected layers FROZEN (ablation)
+    # Rebuttal core controls (see README "Method definitions").
+    "select_once",      # AutoMode until its FIRST scheduled selection, then held fixed
+    "fixed_mixed",      # fixed random set of q/v base layers from step 0, rest LoRA
+    "static_qv",        # q/v base weights of every layer, no adapters
 })
+
+# The five methods the rebuttal campaign accepts (automode.rebuttal contract).
+CORE_METHODS = ("automode", "lora", "select_once", "fixed_mixed", "static_qv")
+
+# Legacy methods whose implementations are known-broken or unvalidated. They are
+# kept in METHODS so legacy configs still parse, but building them raises.
+UNAVAILABLE_METHODS = {
+    "lisa": "optimizer attach path zeroed scheduler base_lrs during warmup; not revalidated",
+    "adagradselect": "same broken optimizer attach path as LISA; not revalidated",
+    "loraga": "silently fell back to plain LoRA when the LoRA-GA fork was missing",
+    "adalora": "update_and_allocate() was never called, so ranks never adapted",
+    "dyn_full_only": "frozen<->merged state transitions were never validated",
+}
+
+# Score-collection protocols. 'optimizer_step' samples the completed
+# accumulation-window gradient once per optimizer update (after tail rescaling,
+# before clipping). 'microbatch_legacy' is the submitted collector, which sampled
+# the partially accumulated gradient after every micro-batch.
+SCORE_COLLECTIONS = ("optimizer_step", "microbatch_legacy")
+
+# Fields that locate or label a run but cannot change its outcome. Everything
+# else in RunConfig is part of the scientific identity hash.
+NON_SCIENTIFIC_FIELDS = frozenset({"output_root", "device", "notes", "tier"})
 
 
 @dataclass
@@ -86,7 +113,16 @@ class RunConfig:
 
     # ─── Model & Precision ───────────────────────────────────────────────────
     model_name: str = "google/gemma-2-2b"
+    model_revision: Optional[str] = None     # immutable HF commit sha (rebuttal resolves it)
+    dataset_revision: Optional[str] = None   # immutable HF dataset commit sha
     dtype: str = "bfloat16"           # bfloat16 | float16 | float32
+    # Gemma-2 soft-caps attention logits; sdpa/flash paths historically ignored it.
+    attn_implementation: str = "eager"
+    # Storage dtype of trainable-eligible q/v BASE weights. "model" keeps them in
+    # cfg.dtype (submitted protocol: pure-bf16 AdamW updates, which round away most
+    # updates at small LR). "float32" keeps fp32 master weights and runs the forward
+    # under autocast(cfg.dtype). Recorded in the run identity either way.
+    base_weight_dtype: str = "model"
     gradient_checkpointing: bool = True
     low_cpu_mem_usage: bool = True
     device: str = "cuda:0"
@@ -101,7 +137,9 @@ class RunConfig:
     method: str = "lora"
 
     # ─── Core Optimization ───────────────────────────────────────────────────
-    seed: int = 42
+    seed: int = 42                     # parameter init / dropout (global torch RNG)
+    data_seed: Optional[int] = None    # data order generator; None -> seed
+    evaluation_seed: int = 20261029    # generation sampling, independent of training RNG
     epochs: int = 2
     learning_rate: float = 5e-5
     weight_decay: float = 0.01
@@ -110,7 +148,7 @@ class RunConfig:
     max_grad_norm: float = 1.0
     train_batch_size: int = 1
     grad_accum_steps: int = 16
-    use_8bit_optim_for_full_ft: bool = True  # bnb.optim.AdamW8bit for full_ft only
+    use_8bit_optim_for_full_ft: bool = True  # bnb.optim.AdamW8bit for full_ft only; raises if bnb missing
 
     # ─── Data Sizing ─────────────────────────────────────────────────────────
     max_train_samples: Optional[int] = None
@@ -118,6 +156,10 @@ class RunConfig:
     max_source_len: int = 384
     max_target_len: int = 128
     max_new_tokens: int = 256
+    # Context budget for multiple-choice retention evals (MMLU/ARC), separate from
+    # the GSM8K training source length so few-shot prompts never lose the question.
+    mc_max_source_len: int = 2048
+    mmlu_n_shot: int = 5
 
     # ─── Generation (Eval) ───────────────────────────────────────────────────
     eval_batch_size: int = 8
@@ -155,10 +197,15 @@ class RunConfig:
     dynamic_threshold: int = 10       # percentile (t)
     importance_signal: str = "grad_norm"   # see ImportanceSignal enum
     switching_mode: str = "percentile"     # see SwitchingMode enum
+    score_collection: str = "optimizer_step"  # see SCORE_COLLECTIONS
     ema_decay: float = 0.9            # for EMA_GRAD
     gumbel_tau_start: float = 5.0     # initial temperature for Gumbel-Softmax
     gumbel_tau_end: float = 0.1       # final temperature
     gumbel_anneal_epochs: Optional[int] = None  # None = full training
+
+    # ─── fixed_mixed control ─────────────────────────────────────────────────
+    fixed_base_layers: Optional[int] = None   # number of layers training q/v base weights
+    allocation_seed: Optional[int] = None     # seeds the layer choice only (stdlib random)
 
     # ─── LISA-style ──────────────────────────────────────────────────────────
     lisa_num_layers: int = 4          # k: number of layers to update per step
@@ -180,6 +227,7 @@ class RunConfig:
     # ─── Misc ────────────────────────────────────────────────────────────────
     tier: int = 0                     # 0=headline, 1=generality, 2=forgetting, 3=ablation
     notes: str = ""
+    protocol_version: str = "unspecified"
 
     # ─── Post-init: validate ─────────────────────────────────────────────────
     def __post_init__(self):
@@ -194,39 +242,37 @@ class RunConfig:
             raise ValueError(f"Unknown switching_mode: {self.switching_mode}")
         if self.dtype not in {"bfloat16", "float16", "float32"}:
             raise ValueError(f"Unknown dtype: {self.dtype}")
+        if self.base_weight_dtype not in {"model", "float32"}:
+            raise ValueError(f"Unknown base_weight_dtype: {self.base_weight_dtype}")
+        if self.score_collection not in SCORE_COLLECTIONS:
+            raise ValueError(f"Unknown score_collection: {self.score_collection}")
+        if self.sampling_k < 1:
+            raise ValueError("sampling_k must be >= 1")
+        # JSON manifests give lists; keep the hashable/immutable tuple form.
+        self.eval_benchmarks = tuple(self.eval_benchmarks)
+        self.lora_target_modules = tuple(self.lora_target_modules)
+        if self.method == "fixed_mixed" and (
+                self.fixed_base_layers is None or self.allocation_seed is None):
+            raise ValueError("fixed_mixed requires fixed_base_layers and allocation_seed")
+
+    @property
+    def effective_data_seed(self) -> int:
+        return self.seed if self.data_seed is None else self.data_seed
 
     # ─── Identity ────────────────────────────────────────────────────────────
+    def scientific_dict(self) -> dict:
+        """Every field that can change the outcome (all but NON_SCIENTIFIC_FIELDS)."""
+        return {k: v for k, v in asdict(self).items() if k not in NON_SCIENTIFIC_FIELDS}
+
     def run_id(self) -> str:
         """
-        12-char hash of the config values that affect training outcome.
-        Excludes notes and tier. Used for resume logic and folder naming.
+        16-hex-char SHA-256 of scientific_dict(). Used for folder naming and
+        resume. Earlier versions hashed a hand-picked subset that omitted e.g.
+        max_train_samples, so smoke and full-data runs collided on one id.
+        Code/protocol identity is added on top of this by automode.rebuttal.
         """
-        payload = {
-            "model": self.model_name,
-            "method": self.method,
-            "track": self.train_track,
-            "eval": sorted(self.eval_benchmarks),
-            "seed": self.seed,
-            "epochs": self.epochs,
-            "lr": self.learning_rate,
-            "bs": self.train_batch_size,
-            "grad_accum": self.grad_accum_steps,
-            "lora_r": self.lora_r,
-            "lora_alpha": self.lora_alpha,
-            "lora_targets": sorted(self.lora_target_modules),
-            "dyn_u": self.dynamic_updates,
-            "dyn_t": self.dynamic_threshold,
-            "imp": self.importance_signal,
-            "mode": self.switching_mode,
-            "topk_k": self.topk_k,
-            "deep_block": (self.deep_block_start, self.deep_block_end),
-            "adalora_init_r": self.adalora_init_r,
-            "adalora_target_r": self.adalora_target_r,
-            "lisa_num": self.lisa_num_layers,
-            "adagrad_pct": self.adagrad_pct,
-        }
-        s = json.dumps(payload, sort_keys=True)
-        return hashlib.md5(s.encode()).hexdigest()[:12]
+        s = json.dumps(self.scientific_dict(), sort_keys=True, default=str)
+        return hashlib.sha256(s.encode()).hexdigest()[:16]
 
     def variant_label(self) -> str:
         """Human-readable method label for plots and CSVs."""
@@ -250,6 +296,12 @@ class RunConfig:
             return f"adagrad_pct{self.adagrad_pct}"
         if m == "dyn_full_only":
             return f"dyn_full_u{self.dynamic_updates}_t{self.dynamic_threshold}"
+        if m == "select_once":
+            return (f"select_once_u{self.dynamic_updates}_t{self.dynamic_threshold}"
+                    f"_{self.importance_signal}_r{self.lora_r}")
+        if m == "fixed_mixed":
+            # allocation_seed is deliberately not in the label: it varies with seed.
+            return f"fixed_mixed_b{self.fixed_base_layers}_r{self.lora_r}"
         return m
 
     def to_dict(self) -> dict:
@@ -261,6 +313,7 @@ class RunConfig:
 # "approximate" — implementation follows the paper's idea but deviates in ways that
 #                 should be noted in the write-up; NOT a drop-in reproduction
 # "preview"    — partial implementation, not intended for headline comparisons
+# "unavailable" — building the method raises (see UNAVAILABLE_METHODS)
 METHOD_FIDELITY = {
     "full_ft":          "faithful",
     "lora":             "faithful",
@@ -268,12 +321,11 @@ METHOD_FIDELITY = {
     "topk_static":      "faithful",
     "topk_deep_block":  "faithful",
     "automode":         "faithful",   # the contribution itself
-    "dyn_full_only":    "faithful",   # ablation of automode
-    "adalora":          "faithful",   # uses upstream peft.AdaLoraConfig
+    "select_once":      "faithful",   # rebuttal control, defined in README
+    "fixed_mixed":      "faithful",   # rebuttal control, defined in README
+    "static_qv":        "faithful",   # rebuttal control, defined in README
     "dora":             "faithful",   # uses upstream peft.LoraConfig(use_dora=True)
-    "lisa":             "approximate",      # now keeps embed+head; still missing period-mutation details
-    "adagradselect":    "approximate",      # fixed explore/exploit; block definition differs from paper
-    "loraga":           "approximate",      # relies on fork; falls back to LoRA if unavailable
+    **{m: "unavailable" for m in UNAVAILABLE_METHODS},
 }
 
 

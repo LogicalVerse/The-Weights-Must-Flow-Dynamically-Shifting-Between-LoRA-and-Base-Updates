@@ -13,15 +13,22 @@ Bugs this module explicitly avoids:
    — solved by finding LoraLayer instances and asking them what layer they
    belong to via get_layer_name_from_module_name().
 
-2. Sawtooth LR — the 9B notebook's rebuild_both-optimizer-and-scheduler pattern
-   restarts warmup on every switch. Here, rebuild_optimizer_only() does just
-   that; the scheduler is built once in train.py and never rebuilt.
+2. Sawtooth / compounding LR — rebuild_optimizer() is the single rebuild path.
+   It keeps the scheduler object (base_lrs, initial_lr, step count, lambdas)
+   and only repoints scheduler.optimizer. Adam state is carried by parameter
+   identity except for parameters that left the trainable set or were reset.
 
 3. Fake FFT mode (forgetting to merge LoRA into base weights before switching
-   to FFT) — solved by calling module.merge() explicitly in promote_to_fft().
+   to FFT) — promote_to_fft() merges exactly once and fails on any other state.
 
-4. Stale adapters on downgrade — demote_to_lora() calls unmerge_adapter() +
-   reset_lora_parameters() to restore a clean A~N, B=0 state.
+4. Stale adapters on downgrade — demote_to_lora() keeps the trained base weight
+   (it NEVER unmerges: the base has received direct updates since the merge),
+   clears PEFT's merged bookkeeping, and re-initialises the adapter to the same
+   distribution PEFT uses at creation: A ~ Uniform(-1/sqrt(d_in), 1/sqrt(d_in))
+   (kaiming_uniform_, a=sqrt(5)), B = 0, so B@A = 0. This is NOT Gaussian.
+   Eval-mode function is preserved across promote/demote; training-mode
+   behaviour is not identical, because LoRA dropout acts only on the adapter
+   path, which is absent in base mode.
 
 5. lm_head / embed_tokens incorrectly trainable — freeze_non_layer_params()
    explicitly freezes them after PEFT wrapping.
@@ -30,13 +37,16 @@ Bugs this module explicitly avoids:
    called from the live model, never cached.
 
 Unit tests in tests/test_switching.py verify the round-trip LoRA→FFT→LoRA
-preserves the parameter count (this would have caught the original prefix bug).
+preserves the parameter count (this would have caught the original prefix bug);
+tests/test_rebuttal_invariants.py checks function preservation, optimizer state
+and LR continuity.
 """
 
 from __future__ import annotations
 import math
 from collections import defaultdict, deque
 from typing import Dict, List, Optional, Tuple, Iterable, Callable
+import random
 
 import numpy as np
 import torch
@@ -332,21 +342,24 @@ class RandomCollector:
     Uniform random scores per layer. Ablation: does the gradient signal
     actually matter, or does any per-layer dynamic selection work?
     """
-    def __init__(self):
+    def __init__(self, rng: Optional[np.random.Generator] = None):
         self.layer_ids: List[str] = []
+        # Dedicated generator: controller randomness never touches global RNGs.
+        self.rng = rng if rng is not None else np.random.default_rng(0)
 
     def accumulate(self, model):
         if not self.layer_ids:
             self.layer_ids = get_all_layer_ids(model)
 
     def compute_scores(self) -> Dict[str, float]:
-        return {lid: float(np.random.rand()) for lid in self.layer_ids}
+        return {lid: float(self.rng.random()) for lid in self.layer_ids}
 
     def reset(self):
         pass
 
 
-def build_importance_collector(signal: str, ema_decay: float = 0.9):
+def build_importance_collector(signal: str, ema_decay: float = 0.9,
+                               rng: Optional[np.random.Generator] = None):
     """Factory for ImportanceSignal."""
     if signal == "grad_norm":
         return GradNormCollector()
@@ -355,93 +368,96 @@ def build_importance_collector(signal: str, ema_decay: float = 0.9):
     if signal == "ema_grad":
         return EMAGradCollector(decay=ema_decay)
     if signal == "random":
-        return RandomCollector()
+        return RandomCollector(rng=rng)
     raise ValueError(f"Unknown importance signal: {signal}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Mode switching primitives.
 #
-# These operate on groups of LoraLayer modules (one group per transformer layer).
-# Each primitive is self-contained and idempotent-safe (calling merge twice
-# doesn't double-merge, because PEFT tracks merged state internally).
+# Strict by design: each primitive validates the PEFT state it expects and
+# raises on anything else. No exception swallowing.
 # ──────────────────────────────────────────────────────────────────────────────
+
+ADAPTER_NAME = "default"
+
+LORA_INIT_DESCRIPTION = (
+    "A ~ Uniform(-1/sqrt(d_in), 1/sqrt(d_in)) (torch kaiming_uniform_ with a=sqrt(5), "
+    "identical to PEFT 0.15.2 init_lora_weights=True); B = 0, so the initial delta "
+    "B@A is exactly zero. Used both at adapter creation (by PEFT) and on demotion "
+    "(by reset_adapter_zero_delta)."
+)
+
+
+def _check_single_default_adapter(mod: LoraLayer) -> None:
+    if list(mod.active_adapters) != [ADAPTER_NAME] or list(mod.lora_A.keys()) != [ADAPTER_NAME]:
+        raise RuntimeError(
+            f"AutoMode expects exactly one active adapter {ADAPTER_NAME!r}; found "
+            f"active={list(mod.active_adapters)}, present={list(mod.lora_A.keys())}"
+        )
+
+
+def _adapter_params(mod: LoraLayer) -> List[torch.nn.Parameter]:
+    return list(mod.lora_A.parameters()) + list(mod.lora_B.parameters())
+
 
 def promote_to_fft(modules: List[LoraLayer]) -> None:
     """
-    Upgrade a layer from LoRA-only to Full-FT.
-
-    Paper spec: θ_l ← θ_l + (α/r)·B_l·A_l, then freeze adapters, unfreeze base.
-
-    Implementation:
-      1. module.merge() fuses the adapter delta into the base weight tensor.
-      2. We freeze the (now-redundant) adapter params.
-      3. We unfreeze the base-layer params.
+    LoRA -> base mode. θ_l ← θ_l + (α/r)·B_l·A_l exactly once (PEFT merge),
+    freeze the adapter, train the base projection only.
     """
     for mod in modules:
-        # Step 1: merge adapter into base. PEFT skips if already merged.
-        try:
-            mod.merge()
-        except Exception:
-            pass  # defensive: some PEFT versions raise if already merged
-        # Step 2: freeze LoRA adapter params (they're now redundant with the merged weight)
-        for p in mod.lora_A.parameters():
+        _check_single_default_adapter(mod)
+        if mod.merged_adapters:
+            raise RuntimeError(f"promote_to_fft: adapter already merged ({mod.merged_adapters})")
+        if any(p.requires_grad for p in mod.get_base_layer().parameters()):
+            raise RuntimeError("promote_to_fft: base weight is already trainable")
+        mod.merge(safe_merge=True, adapter_names=[ADAPTER_NAME])
+        if list(mod.merged_adapters) != [ADAPTER_NAME]:
+            raise RuntimeError(f"promote_to_fft: merge did not register ({mod.merged_adapters})")
+        for p in _adapter_params(mod):
             p.requires_grad = False
-        for p in mod.lora_B.parameters():
-            p.requires_grad = False
-        # Step 3: unfreeze the base layer params
         for p in mod.get_base_layer().parameters():
             p.requires_grad = True
 
 
-def demote_to_lora(modules: List[LoraLayer]) -> None:
-    """
-    Downgrade a layer from Full-FT to LoRA-only.
+def reset_adapter_zero_delta(mod: LoraLayer, generator: torch.Generator) -> List[torch.nn.Parameter]:
+    """Re-initialise the adapter per LORA_INIT_DESCRIPTION. Returns the reset params."""
+    A = mod.lora_A[ADAPTER_NAME].weight
+    B = mod.lora_B[ADAPTER_NAME].weight
+    bound = 1.0 / math.sqrt(A.shape[1])
+    with torch.no_grad():
+        # Draw on CPU from a dedicated generator so the reset is device-independent.
+        A.copy_(torch.empty(A.shape, dtype=torch.float32).uniform_(-bound, bound, generator=generator))
+        B.zero_()
+    if mod.lora_B[ADAPTER_NAME].bias is not None:
+        raise RuntimeError("LoRA bias is not supported by AutoMode")
+    return [A, B]
 
-    Paper spec: freeze current (now-updated) base weights, create fresh adapters.
 
-    Implementation:
-      1. Freeze base layer params (locks in the FFT-phase learning).
-      2. Mark adapters as "unmerged" so PEFT's forward() uses the LoRA path again.
-      3. reset_lora_parameters() reinitialises A~N(0,σ) and B=0, so BA=0 at the
-         start of the LoRA phase — the merged base weight is the starting point.
-      4. Unfreeze adapter params.
+def demote_to_lora(modules: List[LoraLayer],
+                   generator: Optional[torch.Generator] = None) -> List[torch.nn.Parameter]:
     """
+    Base mode -> LoRA. Keeps the fully trained base weight (no unmerge: the base
+    has had direct updates since the merge, so subtracting the old delta would be
+    wrong), clears PEFT's merged bookkeeping, resets the adapter to a zero delta
+    and trains the adapter only. Returns the reset parameters so the optimizer
+    rebuild can discard their (same-identity) Adam state.
+    """
+    if generator is None:
+        generator = torch.Generator().manual_seed(0)
+    reset: List[torch.nn.Parameter] = []
     for mod in modules:
-        # Step 1: freeze base weights
+        _check_single_default_adapter(mod)
+        if list(mod.merged_adapters) != [ADAPTER_NAME]:
+            raise RuntimeError(f"demote_to_lora: expected merged adapter, got {mod.merged_adapters}")
         for p in mod.get_base_layer().parameters():
             p.requires_grad = False
-        # Step 2: tell PEFT the adapter is back in play.
-        # Different PEFT versions track this differently.
-        if hasattr(mod, "merged_adapters"):
-            # Newer PEFT: merged_adapters is a list of adapter names
-            mod.merged_adapters = []
-        try:
-            mod.merged = False  # older PEFT
-        except Exception:
-            pass
-        # Step 3: reset adapter params to fresh A~N, B=0
-        try:
-            mod.reset_lora_parameters("default", True)
-        except TypeError:
-            # Older PEFT signature: reset_lora_parameters(adapter_name) only
-            mod.reset_lora_parameters("default")
-        # Step 4: unfreeze adapter params
-        for p in mod.lora_A.parameters():
+        mod.merged_adapters = []  # bookkeeping only; base weight is untouched
+        reset += reset_adapter_zero_delta(mod, generator)
+        for p in _adapter_params(mod):
             p.requires_grad = True
-        for p in mod.lora_B.parameters():
-            p.requires_grad = True
-
-
-def freeze_layer(modules: List[LoraLayer]) -> None:
-    """Freeze everything in this layer (for dyn_full_only ablation)."""
-    for mod in modules:
-        for p in mod.get_base_layer().parameters():
-            p.requires_grad = False
-        for p in mod.lora_A.parameters():
-            p.requires_grad = False
-        for p in mod.lora_B.parameters():
-            p.requires_grad = False
+    return reset
 
 
 def current_layer_mode(modules: List[LoraLayer]) -> str:
@@ -460,40 +476,92 @@ def current_layer_mode(modules: List[LoraLayer]) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Static allocations and trainable-scope invariant
+# ──────────────────────────────────────────────────────────────────────────────
+
+def fixed_layer_allocation(n_layers: int, k: int, allocation_seed: int) -> List[int]:
+    """k distinct layer indices chosen by stdlib random.Random(allocation_seed).
+    Independent of every torch/numpy RNG, so training seeds cannot perturb it."""
+    if not 0 < k <= n_layers:
+        raise ValueError(f"fixed allocation needs 0 < k <= n_layers, got k={k}, n={n_layers}")
+    return sorted(random.Random(allocation_seed).sample(range(n_layers), k))
+
+
+def is_target_param(name: str, target_modules: Iterable[str]) -> bool:
+    return identify_layer_for_param(name) is not None and any(
+        f".{t}." in name for t in target_modules)
+
+
+def assert_trainable_scope(model, target_modules: Iterable[str]) -> None:
+    """Only q/v (target) projections of numbered layers may be trainable —
+    adapters or base weights. Embeddings, head, norms, other projections: frozen."""
+    targets = tuple(target_modules)
+    bad = [n for n, p in model.named_parameters() if p.requires_grad and not is_target_param(n, targets)]
+    if bad:
+        raise RuntimeError(f"Non-target parameters are trainable: {bad[:5]} (+{max(0, len(bad) - 5)})")
+    if not any(p.requires_grad for p in model.parameters()):
+        raise RuntimeError("No trainable parameters")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Optimizer rebuild — the ONLY rebuild path (train.py uses this too).
+# ──────────────────────────────────────────────────────────────────────────────
+
+def rebuild_optimizer(model, old_optimizer, scheduler=None,
+                      reset_params: Iterable[torch.nn.Parameter] = ()):
+    """
+    New optimizer over the current trainable set.
+
+    * Every param-group hyperparameter (lr, initial_lr, betas, eps, weight_decay,
+      amsgrad, foreach, ...) and optimizer.defaults are copied verbatim.
+    * Adam state is carried by parameter identity for parameters that stay
+      trainable and are not in reset_params. Parameters that left the trainable
+      set lose their state; newly trainable or reset parameters start fresh.
+      reset_params is needed because an in-place reset keeps tensor identity.
+    * The scheduler keeps its base_lrs, last_epoch and lambdas; only its
+      optimizer reference is repointed. (The old helper overwrote base_lrs with
+      the current decayed LR, compounding the decay at every switch.)
+    * All .grad tensors are cleared.
+    """
+    if len(old_optimizer.param_groups) != 1:
+        raise NotImplementedError("rebuild_optimizer supports exactly one param group")
+    params = [p for p in model.parameters() if p.requires_grad]
+    if not params:
+        raise RuntimeError("Optimizer rebuild found zero trainable params after switch.")
+    for p in model.parameters():
+        p.grad = None
+    hyper = {k: v for k, v in old_optimizer.param_groups[0].items() if k != "params"}
+    new_optimizer = type(old_optimizer)([{"params": params, **hyper}])
+    new_optimizer.defaults = dict(old_optimizer.defaults)
+    reset_ids = {id(p) for p in reset_params}
+    for p in params:
+        if id(p) not in reset_ids and p in old_optimizer.state and old_optimizer.state[p]:
+            new_optimizer.state[p] = old_optimizer.state[p]
+    if scheduler is not None:
+        scheduler.optimizer = new_optimizer
+    return new_optimizer
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # The controller: orchestrates signal collection, switching decisions, logging.
 # ──────────────────────────────────────────────────────────────────────────────
 
 class AutoModeController:
     """
-    High-level manager for AutoMode switching.
+    Dynamic LoRA <-> base switching for `automode`, and the `select_once`
+    control (identical until its first scheduled selection, then frozen).
 
-    Usage
-    -----
-    ctrl = AutoModeController(cfg, total_optimizer_steps)
-    ctrl.attach(model, optimizer)
+    Loop contract (train.py):
+      loss.backward()                      -> ctrl.on_micro_step(model)
+      tail rescale, then BEFORE clipping   -> ctrl.on_optimizer_step(model)
+      optimizer.step(); scheduler.step(); opt_step += 1
+      if ctrl.maybe_switch(model, opt_step):
+          optimizer = rebuild_optimizer(model, optimizer, scheduler, ctrl.last_reset_params)
 
-    for batch in loader:
-        loss = model(**batch).loss / grad_accum
-        loss.backward()
-        ctrl.on_micro_step(model)  # accumulates importance signal
-
-        if (step+1) % grad_accum == 0:
-            grad_norm = clip_grad_norm_(...)
-            optimizer.step()
-            scheduler.step()  # NOT ctrl.step()
-            optimizer.zero_grad()
-            opt_step += 1
-
-            changed = ctrl.maybe_switch(model, opt_step)
-            if changed:
-                optimizer = ctrl.rebuild_optimizer_only(model, optimizer)
-                # DO NOT rebuild scheduler — prevents sawtooth LR
-
-    Responsibilities:
-      • Maintain per-step importance signal state
-      • Decide when to switch (based on update_interval)
-      • Execute mode transitions via promote_to_fft / demote_to_lora
-      • Log every switch event for figure reproduction
+    Selection rule (submitted lower-tail percentile): threshold =
+    np.percentile(scores, t); layers with score >= threshold go to base mode.
+    Ties at the threshold are all selected, so the selected count can exceed
+    n - floor(t% of n); it is logged per event, never assumed.
     """
 
     def __init__(
@@ -502,47 +570,47 @@ class AutoModeController:
         total_optimizer_steps: int,
         on_switch_callback: Optional[Callable] = None,
     ):
-        # Current implementation supports ONLY percentile thresholding.
-        # topk_fixed, gumbel, and static are reserved for future work but not wired.
-        # Fail loudly rather than silently ignoring the config field.
         if cfg.switching_mode != "percentile":
             raise NotImplementedError(
                 f"AutoModeController currently implements only switching_mode='percentile'. "
                 f"Got '{cfg.switching_mode}'. The other modes (topk_fixed, gumbel, static) "
-                f"are reserved in the config schema but not implemented. "
-                f"Set cfg.switching_mode='percentile' or extend maybe_switch()."
+                f"are reserved in the config schema but not implemented."
             )
+        if cfg.method not in ("automode", "select_once"):
+            raise ValueError(f"AutoModeController does not implement method {cfg.method!r}")
         self.cfg = cfg
         self.total_steps = total_optimizer_steps
         self.on_switch_callback = on_switch_callback
+        self.select_once = cfg.method == "select_once"
+        self.branch_step: Optional[int] = None
 
-        # Derived
         steps_per_epoch = max(1, total_optimizer_steps // max(cfg.epochs, 1))
-        self.update_interval = max(
-            1, steps_per_epoch // max(cfg.dynamic_updates, 1)
-        )
+        self.update_interval = max(1, steps_per_epoch // max(cfg.dynamic_updates, 1))
 
-        # State populated by attach()
         self._model = None
         self._lora_groups: Dict[str, List[LoraLayer]] = {}
         self._layer_mode: Dict[str, str] = {}
+        # Separate generators: controller scores (random signal) and adapter resets.
         self._collector = build_importance_collector(
-            cfg.importance_signal, ema_decay=cfg.ema_decay
+            cfg.importance_signal, ema_decay=cfg.ema_decay,
+            rng=np.random.default_rng([cfg.seed, 0xC0]),
         )
+        self._reset_generator = torch.Generator().manual_seed(cfg.seed * 1_000_003 + 0xAD)
+        self.last_reset_params: List[torch.nn.Parameter] = []
 
-        # Logging
         self.switch_history: List[dict] = []
         self.last_scores: Dict[str, float] = {}
 
     def attach(self, model, optimizer=None):
         """Register the model (and optionally optimizer for Fisher signal)."""
         self._model = model
-        self._lora_groups = group_lora_modules_by_layer(model)
-        if not self._lora_groups:
+        groups = group_lora_modules_by_layer(model)
+        if not groups:
             raise RuntimeError(
                 "No LoraLayer modules found — AutoMode requires LoRA adapters "
                 "to be present. Did you call get_peft_model() first?"
             )
+        self._lora_groups = dict(sorted(groups.items(), key=lambda kv: int(kv[0].split("_")[1])))
         self._layer_mode = {lid: current_layer_mode(mods)
                             for lid, mods in self._lora_groups.items()}
         if isinstance(self._collector, FisherCollector):
@@ -555,120 +623,89 @@ class AutoModeController:
         if isinstance(self._collector, FisherCollector):
             self._collector.bind_optimizer(optimizer)
 
+    @property
+    def _collects(self) -> bool:
+        return not (self.select_once and self.branch_step is not None) and \
+            self.cfg.importance_signal != "fisher"
+
     def on_micro_step(self, model):
-        """Call after loss.backward() on each micro-step."""
-        if self.cfg.importance_signal != "fisher":
-            # Fisher reads from optimizer state, not grads directly
+        """After each loss.backward(). Only the legacy protocol samples here."""
+        if self.cfg.score_collection == "microbatch_legacy" and self._collects:
+            self._collector.accumulate(model)
+
+    def on_optimizer_step(self, model):
+        """Once per optimizer update, on the completed (tail-rescaled) window
+        gradient, before clipping. Default protocol 'optimizer_step'."""
+        if self.cfg.score_collection == "optimizer_step" and self._collects:
             self._collector.accumulate(model)
 
     def maybe_switch(self, model, opt_step: int) -> bool:
         """
-        Called after optimizer.step(). Returns True iff any layer changed mode
-        (indicating the caller should rebuild the optimizer param list).
+        Called after optimizer.step(). Returns True iff any layer changed mode.
+        Never switches after the final update (nothing would train on it).
         """
-        if opt_step == 0:
+        self.last_reset_params = []
+        if opt_step <= 0 or opt_step % self.update_interval != 0:
             return False
-        if opt_step % self.update_interval != 0:
+        if opt_step >= self.total_steps:
+            return False
+        if self.select_once and self.branch_step is not None:
             return False
 
         scores = self._collector.compute_scores()
-        if not scores:
-            return False
-
-        vals = np.array(list(scores.values()))
+        if set(scores) != set(self._lora_groups):
+            raise RuntimeError(
+                f"Scores missing for layers {sorted(set(self._lora_groups) - set(scores))}; "
+                f"was the collector hook called for this window?")
+        order = list(self._lora_groups)  # numeric layer order
+        vals = np.array([scores[l] for l in order], dtype=np.float64)
+        if not np.all(np.isfinite(vals)):
+            raise RuntimeError(f"Non-finite importance scores at step {opt_step}")
         threshold = float(np.percentile(vals, self.cfg.dynamic_threshold))
+        target_modes = {l: ("full_ft" if scores[l] >= threshold else "lora") for l in order}
+        modes_before = dict(self._layer_mode)
 
-        # Decide new mode per layer
-        target_modes = {}
-        for lid, s in scores.items():
-            if s >= threshold:
-                target_modes[lid] = "full_ft"
-            else:
-                target_modes[lid] = (
-                    "frozen" if self.cfg.method == "dyn_full_only" else "lora"
-                )
-
-        any_changed = False
         transitions = []
-        for lid, target in target_modes.items():
-            mods = self._lora_groups.get(lid)
-            if mods is None:
-                continue
-            current = self._layer_mode.get(lid, "lora")
+        for lid in order:
+            current, target = self._layer_mode[lid], target_modes[lid]
             if current == target:
                 continue
-            # Apply the transition
             if target == "full_ft":
-                promote_to_fft(mods)
-            elif target == "lora":
-                if current == "full_ft":
-                    demote_to_lora(mods)
-                elif current == "frozen":
-                    # Back from frozen → re-enable LoRA adapters
-                    for mod in mods:
-                        for p in mod.lora_A.parameters():
-                            p.requires_grad = True
-                        for p in mod.lora_B.parameters():
-                            p.requires_grad = True
-            elif target == "frozen":
-                freeze_layer(mods)
+                promote_to_fft(self._lora_groups[lid])
+            else:
+                self.last_reset_params += demote_to_lora(self._lora_groups[lid], self._reset_generator)
             self._layer_mode[lid] = target
-            transitions.append((lid, current, target))
-            any_changed = True
+            transitions.append({"layer": lid, "from": current, "to": target})
 
+        if self.select_once:
+            self.branch_step = opt_step
         self.last_scores = scores
 
-        # Always log the decision, even if zero layers flipped.
         trainable, _ = count_trainable_params(model)
+        n_selected = sum(1 for m in target_modes.values() if m == "full_ft")
         self.switch_history.append({
             "step": opt_step,
+            "percentile_t": self.cfg.dynamic_threshold,
             "threshold": threshold,
-            "scores": {k: float(v) for k, v in scores.items()},
+            "score_collection": self.cfg.score_collection,
+            "scores": {k: float(scores[k]) for k in order},
+            "modes_before": modes_before,
             "target_modes": dict(target_modes),
-            "transitions": [
-                {"layer": l, "from": f, "to": t} for (l, f, t) in transitions
-            ],
+            "n_selected_base": n_selected,
+            "n_tied_at_threshold": int(np.sum(vals == threshold)),
+            "transitions": transitions,
             "n_transitions": len(transitions),
             "layer_modes": dict(self._layer_mode),
             "n_fft": sum(1 for m in self._layer_mode.values() if m == "full_ft"),
             "n_lora": sum(1 for m in self._layer_mode.values() if m == "lora"),
-            "n_frozen": sum(1 for m in self._layer_mode.values() if m == "frozen"),
             "trainable_params_after": trainable,
+            "select_once_branch": self.select_once,
         })
         if self.on_switch_callback is not None:
             self.on_switch_callback(self.switch_history[-1])
 
         self._collector.reset()
-        return any_changed
-
-    @staticmethod
-    def rebuild_optimizer_only(model, prev_optimizer):
-        """
-        Construct a new optimizer over the current trainable parameter set,
-        preserving the hyperparameters from the previous optimizer.
-
-        Critically, this does NOT touch the scheduler — that's the caller's
-        responsibility, and the correct thing to do is: don't touch it.
-        """
-        # Extract prev hyperparams
-        group0 = prev_optimizer.param_groups[0]
-        lr = group0.get("lr")
-        wd = group0.get("weight_decay", 0.0)
-
-        params = [p for p in model.parameters() if p.requires_grad]
-        if not params:
-            raise RuntimeError(
-                "Optimizer rebuild found zero trainable params after switch. "
-                "This indicates a switching-logic bug."
-            )
-        # Preserve optimizer class: if prev was AdamW8bit, new is too
-        cls = type(prev_optimizer)
-        try:
-            new_optim = cls(params, lr=lr, weight_decay=wd)
-        except TypeError:
-            # Some optimizers have different init signatures
-            new_optim = torch.optim.AdamW(params, lr=lr, weight_decay=wd)
-        return new_optim
+        return bool(transitions)
 
     def layer_mode_snapshot(self) -> Dict[str, str]:
         """Current {layer_id: mode} for timeline logging."""

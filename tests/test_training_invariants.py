@@ -47,10 +47,7 @@ class TestSchedulerContinuity(unittest.TestCase):
 
     def test_lr_continuous_across_optimizer_rebuild(self):
         from transformers import get_scheduler
-        from automode.train import (
-            rebuild_optimizer_preserving_lr,
-            attach_optimizer_to_scheduler,
-        )
+        from automode.core import rebuild_optimizer
 
         # Build a trivial model with trainable parameters
         model = FakeCausalLM(n_layers=3, d=16)
@@ -82,8 +79,7 @@ class TestSchedulerContinuity(unittest.TestCase):
             if i % 2 == 0:
                 p.requires_grad = False
 
-        new_optimizer = rebuild_optimizer_preserving_lr(optimizer, model, cfg)
-        attach_optimizer_to_scheduler(scheduler, new_optimizer)
+        new_optimizer = rebuild_optimizer(model, optimizer, scheduler)
 
         # Continue stepping the scheduler
         lrs_after_switch = []
@@ -117,10 +113,7 @@ class TestSchedulerContinuity(unittest.TestCase):
     def test_scheduler_internal_step_counter_preserved(self):
         """The scheduler's internal ._step_count must NOT reset on optimizer swap."""
         from transformers import get_scheduler
-        from automode.train import (
-            rebuild_optimizer_preserving_lr,
-            attach_optimizer_to_scheduler,
-        )
+        from automode.core import rebuild_optimizer
         from automode.config import RunConfig
 
         model = FakeCausalLM(n_layers=2, d=16)
@@ -136,8 +129,7 @@ class TestSchedulerContinuity(unittest.TestCase):
 
         # Rebuild optimizer (same as what maybe_switch triggers)
         cfg = RunConfig(method="lora")
-        new_optim = rebuild_optimizer_preserving_lr(optimizer, model, cfg)
-        attach_optimizer_to_scheduler(scheduler, new_optim)
+        new_optim = rebuild_optimizer(model, optimizer, scheduler)
 
         # The _step_count should be unchanged — that's the whole point.
         count_after = scheduler._step_count
@@ -324,7 +316,7 @@ class TestMethodFidelity(unittest.TestCase):
 
     def test_fidelity_values_are_canonical(self):
         from automode.config import METHOD_FIDELITY
-        allowed = {"faithful", "approximate", "preview"}
+        allowed = {"faithful", "approximate", "preview", "unavailable"}
         for method, fidelity in METHOD_FIDELITY.items():
             self.assertIn(fidelity, allowed,
                           f"Method {method}: invalid fidelity {fidelity!r}")

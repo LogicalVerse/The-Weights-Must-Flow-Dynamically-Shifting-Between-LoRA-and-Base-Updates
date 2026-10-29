@@ -1,0 +1,215 @@
+{
+  "schema_version": 1,
+  "protocol_version": "automode_rebuttal_corrected_v1",
+  "expected_eval_count": 1319,
+  "minimum_vram_gib": 70,
+  "common": {
+    "model_name": "google/gemma-2-9b",
+    "model_revision": null,
+    "dataset_revision": null,
+    "train_track": "gsm8k",
+    "eval_benchmarks": [
+      "gsm8k"
+    ],
+    "dtype": "bfloat16",
+    "gradient_checkpointing": true,
+    "epochs": 2,
+    "learning_rate": 2e-05,
+    "lr_scheduler": "linear",
+    "warmup_ratio": 0.03,
+    "weight_decay": 0.01,
+    "max_grad_norm": 1.0,
+    "train_batch_size": 4,
+    "grad_accum_steps": 8,
+    "max_train_samples": null,
+    "max_eval_samples": null,
+    "max_source_len": 384,
+    "max_target_len": 128,
+    "max_new_tokens": 256,
+    "eval_batch_size": 8,
+    "do_sample": true,
+    "temperature": 0.7,
+    "top_p": 0.95,
+    "sampling_k": 3,
+    "evaluation_seed": 20261029,
+    "lora_r": 16,
+    "lora_alpha": 32,
+    "lora_dropout": 0.05,
+    "lora_target_modules": [
+      "q_proj",
+      "v_proj"
+    ],
+    "dynamic_updates": 10,
+    "dynamic_threshold": 10,
+    "importance_signal": "grad_norm",
+    "score_collection": "optimizer_step",
+    "switching_mode": "percentile",
+    "save_model": false,
+    "save_eval_predictions": true,
+    "use_8bit_optim_for_full_ft": false
+  },
+  "jobs": [
+    {
+      "job_id": "s8_automode",
+      "worker_id": 0,
+      "overrides": {
+        "method": "automode",
+        "seed": 8,
+        "data_seed": 8,
+        "save_model": true
+      }
+    },
+    {
+      "job_id": "s8_select_once",
+      "worker_id": 0,
+      "overrides": {
+        "method": "select_once",
+        "seed": 8,
+        "data_seed": 8,
+        "save_model": true
+      }
+    },
+    {
+      "job_id": "s8_fixed_mixed",
+      "worker_id": 0,
+      "overrides": {
+        "method": "fixed_mixed",
+        "seed": 8,
+        "data_seed": 8,
+        "save_model": true,
+        "fixed_base_layers": 37,
+        "allocation_seed": 8
+      }
+    },
+    {
+      "job_id": "s8_static_qv",
+      "worker_id": 0,
+      "overrides": {
+        "method": "static_qv",
+        "seed": 8,
+        "data_seed": 8,
+        "save_model": true
+      }
+    },
+    {
+      "job_id": "s25_automode",
+      "worker_id": 1,
+      "overrides": {
+        "method": "automode",
+        "seed": 25,
+        "data_seed": 25,
+        "save_model": false
+      }
+    },
+    {
+      "job_id": "s25_select_once",
+      "worker_id": 1,
+      "overrides": {
+        "method": "select_once",
+        "seed": 25,
+        "data_seed": 25,
+        "save_model": false
+      }
+    },
+    {
+      "job_id": "s25_fixed_mixed",
+      "worker_id": 1,
+      "overrides": {
+        "method": "fixed_mixed",
+        "seed": 25,
+        "data_seed": 25,
+        "save_model": false,
+        "fixed_base_layers": 37,
+        "allocation_seed": 25
+      }
+    },
+    {
+      "job_id": "s25_static_qv",
+      "worker_id": 1,
+      "overrides": {
+        "method": "static_qv",
+        "seed": 25,
+        "data_seed": 25,
+        "save_model": false
+      }
+    },
+    {
+      "job_id": "s42_automode",
+      "worker_id": 2,
+      "overrides": {
+        "method": "automode",
+        "seed": 42,
+        "data_seed": 42,
+        "save_model": false
+      }
+    },
+    {
+      "job_id": "s42_select_once",
+      "worker_id": 2,
+      "overrides": {
+        "method": "select_once",
+        "seed": 42,
+        "data_seed": 42,
+        "save_model": false
+      }
+    },
+    {
+      "job_id": "s42_fixed_mixed",
+      "worker_id": 2,
+      "overrides": {
+        "method": "fixed_mixed",
+        "seed": 42,
+        "data_seed": 42,
+        "save_model": false,
+        "fixed_base_layers": 37,
+        "allocation_seed": 42
+      }
+    },
+    {
+      "job_id": "s42_static_qv",
+      "worker_id": 2,
+      "overrides": {
+        "method": "static_qv",
+        "seed": 42,
+        "data_seed": 42,
+        "save_model": false
+      }
+    },
+    {
+      "job_id": "s8_lora_r32",
+      "worker_id": 3,
+      "overrides": {
+        "method": "lora",
+        "seed": 8,
+        "data_seed": 8,
+        "lora_r": 32,
+        "lora_alpha": 64,
+        "save_model": true
+      }
+    },
+    {
+      "job_id": "s25_lora_r32",
+      "worker_id": 3,
+      "overrides": {
+        "method": "lora",
+        "seed": 25,
+        "data_seed": 25,
+        "lora_r": 32,
+        "lora_alpha": 64,
+        "save_model": false
+      }
+    },
+    {
+      "job_id": "s42_lora_r32",
+      "worker_id": 3,
+      "overrides": {
+        "method": "lora",
+        "seed": 42,
+        "data_seed": 42,
+        "lora_r": 32,
+        "lora_alpha": 64,
+        "save_model": false
+      }
+    }
+  ]
+}

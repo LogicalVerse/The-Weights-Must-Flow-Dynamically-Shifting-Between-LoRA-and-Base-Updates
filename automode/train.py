@@ -7,10 +7,10 @@ Design principles
    is isolated in build_model_for_method() (from models.py) and applied via
    the controller pattern (AutoMode) or via static requires_grad flags (rest).
 
-2. Scheduler is built ONCE and NEVER rebuilt. This fixes the sawtooth LR bug
-   that still exists in the 9B notebook. When a switch happens, we rebuild
-   the optimizer's param list but preserve the scheduler's internal step count
-   by swapping optimizer references.
+2. Scheduler is built ONCE and NEVER rebuilt. On a switch, core.rebuild_optimizer
+   (the single rebuild path) builds a new optimizer over the new trainable set,
+   carries Adam state by parameter identity, and repoints scheduler.optimizer
+   without touching base_lrs / initial_lr / step count.
 
 3. Every run writes the same canonical set of logs to disk:
      configs/run_config.json       — exact hyperparameters
@@ -21,19 +21,23 @@ Design principles
      dynamic/switch_history.json    — AutoMode only: every switch event
      dynamic/layer_timeline.json    — per-step {layer_id: mode}
      evals/<benchmark>_eval.json    — full predictions + correctness
-     checkpoints/final_model/       — saved only if cfg.save_model
+     dynamic/switch_diagnostics.json — permanence / re-promotion / occupancy summary
+     export/                        — verified FULL inference export (cfg.save_model);
+                                      written after all evaluations, see automode.export
 
-4. Resume-safe: if logs/run_config.json already exists AND evals/*.json shows
-   a completed run, the runner skips this config.
+4. Resume-safe: a run is skipped only if its COMPLETE marker records the same
+   run_id and config. Failures never write COMPLETE.
 
 5. Peak VRAM measured and reported, so the paper table has compute numbers
    alongside accuracy.
 """
 
 from __future__ import annotations
+import contextlib
 import gc
 import json
 import math
+import os
 import time
 from copy import deepcopy
 from pathlib import Path
@@ -45,15 +49,17 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from automode.config import RunConfig
+from automode.config import RunConfig, CORE_METHODS, UNAVAILABLE_METHODS
 from automode.core import (
     AutoModeController,
+    assert_trainable_scope,
     count_trainable_params,
     freeze_non_layer_params,
     group_lora_modules_by_layer,
     identify_layer_for_param,
     current_layer_mode,
     get_transformer_layers,
+    rebuild_optimizer,
 )
 
 
@@ -95,8 +101,14 @@ def ensure_dirs(cfg: RunConfig) -> Dict[str, Path]:
 
 
 def save_json(obj, path: Path):
-    with open(path, "w") as f:
+    """Atomic write: readers never observe a partial file."""
+    path = Path(path)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    with open(tmp, "w") as f:
         json.dump(obj, f, indent=2, ensure_ascii=False, default=str)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
 
 
 def load_json(path: Path):
@@ -111,11 +123,33 @@ def cleanup_memory():
         torch.cuda.reset_peak_memory_stats()
 
 
+def resolve_device(cfg: RunConfig) -> torch.device:
+    return torch.device(cfg.device if (torch.cuda.is_available() or not cfg.device.startswith("cuda")) else "cpu")
+
+
+def autocast_ctx(cfg: RunConfig, device: torch.device):
+    """bf16 autocast only when fp32 master base weights are in use."""
+    if cfg.base_weight_dtype == "float32" and DTYPE_MAP[cfg.dtype] != torch.float32:
+        return torch.autocast(device_type=device.type, dtype=DTYPE_MAP[cfg.dtype])
+    return contextlib.nullcontext()
+
+
+def cuda_sync(device: torch.device):
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
 def is_run_complete(cfg: RunConfig) -> bool:
-    """Check if this run has written a successful completion marker."""
-    paths = ensure_dirs(cfg)
-    marker = paths["run"] / "COMPLETE"
-    return marker.exists()
+    """True only for a COMPLETE marker written for this exact run_id and config."""
+    marker = Path(cfg.output_root) / cfg.run_id() / "COMPLETE"
+    if not marker.exists():
+        return False
+    try:
+        done = load_json(marker)
+    except (OSError, json.JSONDecodeError):
+        return False
+    return (done.get("status") == "ok" and done.get("run_id") == cfg.run_id()
+            and done.get("scientific_config") == json.loads(json.dumps(cfg.scientific_dict(), default=str)))
 
 
 def mark_run_complete(cfg: RunConfig, summary: dict):
@@ -129,11 +163,8 @@ def mark_run_complete(cfg: RunConfig, summary: dict):
 
 def build_optimizer(model, cfg: RunConfig):
     """
-    Choose the optimizer based on method.
-
-    Full-FT on memory-constrained GPUs uses AdamW8bit from bitsandbytes, which
-    stores optimizer states in int8 and cuts optimizer memory ~4×. Every other
-    method uses standard AdamW.
+    AdamW for every method. Full-FT may request bitsandbytes AdamW8bit; if it is
+    requested and unavailable we raise instead of silently changing optimizer.
     """
     params = [p for p in model.parameters() if p.requires_grad]
     if not params:
@@ -142,13 +173,10 @@ def build_optimizer(model, cfg: RunConfig):
         )
 
     if cfg.method == "full_ft" and cfg.use_8bit_optim_for_full_ft:
-        try:
-            import bitsandbytes as bnb
-            return bnb.optim.AdamW8bit(
-                params, lr=cfg.learning_rate, weight_decay=cfg.weight_decay,
-            )
-        except Exception as e:
-            print(f"[optimizer] AdamW8bit unavailable ({e}); falling back to AdamW.")
+        import bitsandbytes as bnb  # ImportError propagates: no silent fallback
+        return bnb.optim.AdamW8bit(
+            params, lr=cfg.learning_rate, weight_decay=cfg.weight_decay,
+        )
     return torch.optim.AdamW(
         params, lr=cfg.learning_rate, weight_decay=cfg.weight_decay,
     )
@@ -162,57 +190,6 @@ def build_scheduler(optimizer, total_steps: int, cfg: RunConfig):
         name=cfg.lr_scheduler, optimizer=optimizer,
         num_warmup_steps=warmup, num_training_steps=total_steps,
     )
-
-
-def rebuild_optimizer_preserving_lr(prev_optim, model, cfg: RunConfig):
-    """
-    When switching changes the trainable parameter set, we need a new
-    optimizer with the new param list. The CURRENT learning rate (after
-    whatever the scheduler has already applied) must be preserved.
-
-    We do this by:
-      1. Getting the current effective LR from prev_optim's param groups.
-      2. Constructing the new optimizer with that LR as its 'base'.
-      3. NOT rebuilding the scheduler — the existing scheduler keeps stepping
-         its internal counter and will compute future LRs based on total_steps.
-
-    Critical: This means the scheduler and optimizer diverge in their sense
-    of "base LR", but since scheduler.step() computes LR relative to the
-    optimizer's CURRENT lr (not a stored base), this works out. We also set
-    param_group["lr"] to what the scheduler just computed, so it's consistent.
-    """
-    current_lr = prev_optim.param_groups[0]["lr"]
-    current_wd = prev_optim.param_groups[0].get("weight_decay", cfg.weight_decay)
-
-    params = [p for p in model.parameters() if p.requires_grad]
-    if not params:
-        raise RuntimeError("Rebuild_optimizer found zero trainable params.")
-
-    # Preserve optimizer class
-    cls = type(prev_optim)
-    try:
-        new_optim = cls(params, lr=current_lr, weight_decay=current_wd)
-    except TypeError:
-        new_optim = torch.optim.AdamW(params, lr=current_lr, weight_decay=current_wd)
-    return new_optim
-
-
-def attach_optimizer_to_scheduler(scheduler, new_optimizer):
-    """
-    Swap the scheduler's optimizer reference in-place.
-
-    The scheduler's .step() reads/writes optimizer.param_groups[i]["lr"].
-    By swapping the reference, future scheduler.step() calls update the NEW
-    optimizer's LR without resetting any step counters or warmup progress.
-    """
-    scheduler.optimizer = new_optimizer
-    # Some schedulers cache base LR per param group; reset those to the
-    # first param group's LR from the new optimizer.
-    if hasattr(scheduler, "base_lrs"):
-        base = new_optimizer.param_groups[0]["lr"]
-        scheduler.base_lrs = [
-            base for _ in scheduler.base_lrs
-        ]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -234,6 +211,10 @@ def compute_total_grad_norm(model) -> float:
 
 class LisaController:
     """
+    UNAVAILABLE (see config.UNAVAILABLE_METHODS): its optimizer attach path
+    zeroed scheduler base_lrs during warmup, so earlier LISA scores are not
+    trustworthy. Kept for reference; train_one_run refuses to run it.
+
     LISA baseline (Pan et al. 2024, arXiv:2403.17919v4).
 
     Paper Algorithm 1: every K iterations, freeze all layers EXCEPT:
@@ -338,6 +319,9 @@ class LisaController:
 
 class AdaGradSelectController:
     """
+    UNAVAILABLE (see config.UNAVAILABLE_METHODS) — same broken attach path as
+    LisaController. Kept for reference; train_one_run refuses to run it.
+
     AdaGradSelect baseline (Kumar et al. 2025, arXiv:2512.15764v1).
 
     Paper Algorithm 2:
@@ -507,228 +491,238 @@ class AdaGradSelectController:
 # The main training function
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _base_trainable_params(model) -> List[torch.nn.Parameter]:
+    """Trainable non-adapter weights (base projections in base mode)."""
+    return [p for n, p in model.named_parameters() if p.requires_grad and "lora_" not in n]
+
+
+def _dtype_census(model, optimizer) -> Dict[str, Dict[str, int]]:
+    """numel per dtype for trainable params and for each optimizer state tensor
+    (the training loop keeps the max seen over the run, i.e. across modes)."""
+    out: Dict[str, Dict[str, int]] = {"trainable_params": {}}
+    for p in model.parameters():
+        if p.requires_grad:
+            d = out["trainable_params"]
+            d[str(p.dtype)] = d.get(str(p.dtype), 0) + p.numel()
+    for state in optimizer.state.values():
+        for k, v in state.items():
+            if torch.is_tensor(v) and v.dim() > 0:
+                d = out.setdefault(f"optimizer_state.{k}", {})
+                d[str(v.dtype)] = d.get(str(v.dtype), 0) + v.numel()
+    return out
+
+
 def train_one_run(
     cfg: RunConfig,
     model,
     train_loader: DataLoader,
     tokenizer,
     paths: Dict[str, Path],
+    progress_every: int = 25,
 ) -> Tuple[Any, Dict[str, Any]]:
     """
-    Train `model` under the policy specified by cfg.method. Returns (model, stats).
+    Train `model` under cfg.method. Returns (model, stats). Does NOT save a
+    checkpoint: the verified full export runs after evaluation (automode.export).
 
-    Assumes:
-      - model has been built by build_model_for_method() (in models.py)
-      - train_loader yields tokenized batches with input_ids, attention_mask, labels
-      - paths from ensure_dirs()
+    Accumulation: the loss of every micro-batch is divided by grad_accum_steps;
+    the last window of an epoch may be partial and its gradient is rescaled by
+    grad_accum_steps / window so it is a mean over the window. Importance scores
+    (score_collection='optimizer_step') are sampled once per update, after that
+    rescale and before clipping. Switches happen only after optimizer.step(),
+    never after the final update.
     """
-    start_time = time.time()
-    device = cfg.device if torch.cuda.is_available() else "cpu"
+    if cfg.method in UNAVAILABLE_METHODS:
+        raise NotImplementedError(f"{cfg.method} is unavailable: {UNAVAILABLE_METHODS[cfg.method]}")
+    from automode.analysis import switch_diagnostics
 
-    # ─── Total optimizer steps across all epochs ─────────────────────────────
-    # We count both full windows AND the tail (partial) window, because we
-    # flush the tail at end-of-epoch below with properly-rescaled gradients.
-    # This keeps opt_step count consistent between the code and the scheduler.
+    device = resolve_device(cfg)
     micro_per_epoch = len(train_loader)
-    full_opt_per_epoch = micro_per_epoch // cfg.grad_accum_steps
-    has_tail = (micro_per_epoch % cfg.grad_accum_steps) != 0
-    opt_per_epoch = full_opt_per_epoch + (1 if has_tail else 0)
+    opt_per_epoch = math.ceil(micro_per_epoch / cfg.grad_accum_steps)
     total_opt_steps = opt_per_epoch * cfg.epochs
     if total_opt_steps == 0:
         raise ValueError(
             f"Computed total_opt_steps=0 (micro_per_epoch={micro_per_epoch}, "
-            f"grad_accum={cfg.grad_accum_steps}, epochs={cfg.epochs}). "
-            f"Reduce grad_accum_steps or increase dataset size."
+            f"grad_accum={cfg.grad_accum_steps}, epochs={cfg.epochs})."
         )
+    if cfg.method in CORE_METHODS:
+        assert_trainable_scope(model, cfg.lora_target_modules)
 
-    # ─── Optimizer + scheduler ───────────────────────────────────────────────
     optimizer = build_optimizer(model, cfg)
     scheduler = build_scheduler(optimizer, total_opt_steps, cfg)
 
-    # ─── Controller (for dynamic methods) ────────────────────────────────────
     controller = None
-    if cfg.method in ("automode", "dyn_full_only"):
+    if cfg.method in ("automode", "select_once"):
         controller = AutoModeController(cfg, total_opt_steps)
         controller.attach(model, optimizer)
-    elif cfg.method == "lisa":
-        controller = LisaController(cfg, total_opt_steps)
-        controller.attach(model, optimizer)
-        # LISA changes trainable params at attach() — rebuild optimizer once
-        optimizer = rebuild_optimizer_preserving_lr(optimizer, model, cfg)
-        attach_optimizer_to_scheduler(scheduler, optimizer)
-    elif cfg.method == "adagradselect":
-        controller = AdaGradSelectController(cfg, total_opt_steps)
-        controller.attach(model, optimizer)
-        optimizer = rebuild_optimizer_preserving_lr(optimizer, model, cfg)
-        attach_optimizer_to_scheduler(scheduler, optimizer)
+        initial_modes = controller.layer_mode_snapshot()
+    else:
+        initial_modes = getattr(model, "automode_layer_modes", None)
 
-    # ─── Logging buffers ─────────────────────────────────────────────────────
     loss_log: List[dict] = []
     lr_log: List[dict] = []
     grad_norm_log: List[dict] = []
     param_log: List[dict] = []
+    probe_log: List[dict] = []
     layer_timeline: List[dict] = []
-
-    # Initial snapshot (step 0)
     trainable_0, total_params = count_trainable_params(model)
     param_log.append({"step": 0, "trainable_params": trainable_0, "total_params": total_params})
-    if controller is not None:
-        layer_timeline.append({"step": 0, "modes": controller.layer_mode_snapshot()})
+    if initial_modes is not None:
+        layer_timeline.append({"step": 0, "modes": dict(initial_modes)})
+    dtype_census: Dict[str, Dict[str, int]] = {}
 
-    # ─── Training loop ───────────────────────────────────────────────────────
+    def flush_logs():
+        save_json({"loss_log": loss_log}, paths["logs"] / "training_loss.json")
+        save_json({"lr_log": lr_log}, paths["logs"] / "lr_schedule.json")
+        save_json({"grad_norm_log": grad_norm_log}, paths["logs"] / "grad_norms.json")
+        save_json({"param_log": param_log}, paths["logs"] / "trainable_params.json")
+        save_json({"base_update_probe": probe_log}, paths["logs"] / "base_update_probe.json")
+        if controller is not None:
+            save_json({"switch_history": controller.switch_history,
+                       "update_interval": controller.update_interval,
+                       "branch_step": controller.branch_step},
+                      paths["dynamic"] / "switch_history.json")
+        if layer_timeline:
+            save_json({"layer_timeline": layer_timeline}, paths["dynamic"] / "layer_timeline.json")
+
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    cuda_sync(device)
+    start_time = time.perf_counter()
     model.train()
     optimizer.zero_grad(set_to_none=True)
     opt_step = 0
-    running_micro_loss = 0.0
-    micro_in_window = 0   # tracks how many micro-batches are in the current accumulation window
-
-    def _do_optimizer_step(window_size: int, epoch_1based: int):
-        """
-        Execute one optimizer step given the current accumulated gradients.
-        `window_size` is the number of micro-batches that contributed to the grads.
-        If window_size < grad_accum_steps, we rescale so the gradient represents
-        the mean gradient over the actual window, matching full-window semantics.
-        """
-        nonlocal opt_step, running_micro_loss, micro_in_window, optimizer
-        if window_size == 0:
-            return False
-
-        # Rescale gradients if this is a partial (tail) window.
-        # Loss was divided by grad_accum_steps each micro-step, giving
-        # sum_i(g_i / grad_accum). We want sum_i(g_i / window_size) so the
-        # gradient magnitude matches a full window. Scale by grad_accum/window_size.
-        if window_size != cfg.grad_accum_steps:
-            scale = cfg.grad_accum_steps / window_size
-            for p in model.parameters():
-                if p.grad is not None:
-                    p.grad.mul_(scale)
-
-        grad_norm_before_clip = compute_total_grad_norm(model)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
-
-        optimizer.step()
-        scheduler.step()
-        optimizer.zero_grad(set_to_none=True)
-        opt_step += 1
-
-        current_lr = scheduler.get_last_lr()[0]
-
-        # Mean loss per micro-batch in this window (unit-consistent across full/tail)
-        mean_loss = (running_micro_loss * cfg.grad_accum_steps) / window_size
-
-        loss_log.append({
-            "step": opt_step, "epoch": epoch_1based,
-            "loss": round(mean_loss, 6),
-            "window_size": window_size,     # so figures can mark partial windows
-        })
-        lr_log.append({"step": opt_step, "lr": float(current_lr)})
-        grad_norm_log.append({
-            "step": opt_step, "grad_norm": round(grad_norm_before_clip, 6),
-        })
-        trainable_now, _ = count_trainable_params(model)
-        param_log.append({
-            "step": opt_step, "epoch": epoch_1based,
-            "trainable_params": trainable_now,
-        })
-
-        running_micro_loss = 0.0
-        micro_in_window = 0
-        return True
+    switch_overhead = 0.0
+    first_promotion_step: Optional[int] = None
+    trainable_per_update: List[int] = []
 
     for epoch in range(cfg.epochs):
-        epoch_start = time.time()
-        pbar = tqdm(
-            train_loader,
-            desc=f"Epoch {epoch+1}/{cfg.epochs} [{cfg.method}]",
-            leave=False,
-        )
+        epoch_start = time.perf_counter()
         n_batches = len(train_loader)
+        window_losses: List[float] = []
+        t_window = time.perf_counter()
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{cfg.epochs} [{cfg.method}]", leave=False)
         for micro_step, batch in enumerate(pbar):
             batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
-
-            # Forward + backward
-            outputs = model(**batch)
-            loss = outputs.loss / cfg.grad_accum_steps
-            loss.backward()
-            running_micro_loss += loss.item()
-            micro_in_window += 1
-
-            # Importance signal accumulation (AutoMode etc.)
+            with autocast_ctx(cfg, device):
+                loss = model(**batch)["loss"]
+            if not torch.isfinite(loss.detach()):
+                raise FloatingPointError(f"Non-finite loss at epoch {epoch+1}, micro-step {micro_step}")
+            (loss / cfg.grad_accum_steps).backward()
+            window_losses.append(float(loss.detach().item()))
             if controller is not None:
                 controller.on_micro_step(model)
 
-            is_full_window = (micro_step + 1) % cfg.grad_accum_steps == 0
-            is_last_micro = (micro_step + 1) == n_batches
-            # Trigger opt step if we've completed a full window OR we're at
-            # the final micro-batch of the epoch with leftover grads in the window.
-            if is_full_window or (is_last_micro and micro_in_window > 0):
-                did_step = _do_optimizer_step(micro_in_window, epoch + 1)
+            if len(window_losses) < cfg.grad_accum_steps and micro_step + 1 < n_batches:
+                continue
 
-                if did_step and controller is not None:
-                    changed = controller.maybe_switch(model, opt_step)
-                    if changed:
-                        optimizer = rebuild_optimizer_preserving_lr(
-                            optimizer, model, cfg,
-                        )
-                        attach_optimizer_to_scheduler(scheduler, optimizer)
-                        controller.rebind_optimizer(optimizer)
-                        layer_timeline.append({
-                            "step": opt_step,
-                            "modes": controller.layer_mode_snapshot(),
-                        })
+            # ── one optimizer update over the completed (possibly tail) window ──
+            window = len(window_losses)
+            if window != cfg.grad_accum_steps:
+                scale = cfg.grad_accum_steps / window
+                for p in model.parameters():
+                    if p.grad is not None:
+                        p.grad.mul_(scale)
+            if controller is not None:
+                controller.on_optimizer_step(model)
+            trainable_params = [p for p in model.parameters() if p.requires_grad]
+            trainable_per_update.append(sum(p.numel() for p in trainable_params))
+            # Base-update efficacy probe (every update): fraction of trainable base
+            # weight elements the optimizer step actually changes. With pure-bf16
+            # base weights most Adam updates at small LR round to no change.
+            probe = _base_trainable_params(model)
+            snapshots = [p.detach().clone() for p in probe]
+            lr_used = optimizer.param_groups[0]["lr"]
+            grad_norm = float(torch.nn.utils.clip_grad_norm_(trainable_params, cfg.max_grad_norm))
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
+            opt_step += 1
+            if probe:
+                changed = sum(int((p.detach() != s).sum()) for p, s in zip(probe, snapshots))
+                total = sum(p.numel() for p in probe)
+                probe_log.append({"step": opt_step, "lr": lr_used, "n_elements": total,
+                                  "changed_fraction": changed / total})
+                del snapshots
+            for key, by_dtype in _dtype_census(model, optimizer).items():  # max numel seen per dtype
+                for dt, n in by_dtype.items():
+                    dtype_census.setdefault(key, {})[dt] = max(dtype_census.get(key, {}).get(dt, 0), n)
+            cuda_sync(device)
+            now = time.perf_counter()
+            loss_log.append({"step": opt_step, "epoch": epoch + 1,
+                             "loss": round(sum(window_losses) / window, 6),
+                             "window_size": window, "step_sec": now - t_window})
+            lr_log.append({"step": opt_step, "lr": float(lr_used)})
+            grad_norm_log.append({"step": opt_step, "grad_norm": round(grad_norm, 6)})
+            param_log.append({"step": opt_step, "epoch": epoch + 1,
+                              "trainable_params": trainable_per_update[-1]})
+            window_losses = []
 
-                if loss_log:
-                    pbar.set_postfix({
-                        "loss": loss_log[-1]["loss"],
-                        "lr": f"{lr_log[-1]['lr']:.2e}",
-                    })
+            if controller is not None:
+                n_events = len(controller.switch_history)
+                if controller.maybe_switch(model, opt_step):
+                    optimizer = rebuild_optimizer(model, optimizer, scheduler, controller.last_reset_params)
+                    controller.rebind_optimizer(optimizer)
+                    assert_trainable_scope(model, cfg.lora_target_modules)
+                    layer_timeline.append({"step": opt_step, "modes": controller.layer_mode_snapshot()})
+                if len(controller.switch_history) > n_events:
+                    cuda_sync(device)
+                    switch_overhead += time.perf_counter() - now
+                    if first_promotion_step is None and controller.switch_history[-1]["n_fft"] > 0:
+                        first_promotion_step = opt_step
+                    flush_logs()
+            if opt_step % progress_every == 0:
+                flush_logs()
+            pbar.set_postfix({"loss": loss_log[-1]["loss"], "lr": f"{lr_used:.2e}"})
+            t_window = time.perf_counter()
 
-        epoch_time = time.time() - epoch_start
-        print(f"[epoch {epoch+1}/{cfg.epochs}] "
-              f"time={epoch_time:.1f}s | "
-              f"last_loss={loss_log[-1]['loss']:.4f} | "
-              f"trainable={param_log[-1]['trainable_params']:,}")
+        print(f"[epoch {epoch+1}/{cfg.epochs}] time={time.perf_counter() - epoch_start:.1f}s | "
+              f"last_loss={loss_log[-1]['loss']:.4f} | trainable={param_log[-1]['trainable_params']:,}",
+              flush=True)
 
-    train_time = time.time() - start_time
-    peak_vram_gb = (
-        torch.cuda.max_memory_allocated() / (1024 ** 3)
-        if torch.cuda.is_available() else 0.0
-    )
+    cuda_sync(device)
+    train_time = time.perf_counter() - start_time
+    if opt_step != total_opt_steps:
+        raise RuntimeError(f"Ran {opt_step} optimizer steps, expected {total_opt_steps}")
+    if layer_timeline:
+        layer_timeline.append({"step": opt_step, "modes": dict(layer_timeline[-1]["modes"]), "final": True})
+    flush_logs()
 
-    # ─── Save all logs ───────────────────────────────────────────────────────
-    save_json({"loss_log": loss_log}, paths["logs"] / "training_loss.json")
-    save_json({"lr_log": lr_log}, paths["logs"] / "lr_schedule.json")
-    save_json({"grad_norm_log": grad_norm_log}, paths["logs"] / "grad_norms.json")
-    save_json({"param_log": param_log}, paths["logs"] / "trainable_params.json")
+    # Static allocations: base mode from update 1 if a layer starts in base mode.
+    if first_promotion_step is None and initial_modes and "full_ft" in initial_modes.values():
+        first_promotion_step = 0
+    post = [e["step_sec"] for e in loss_log
+            if first_promotion_step is not None and e["step"] > first_promotion_step]
+    diagnostics = None
+    if initial_modes is not None:
+        diagnostics = switch_diagnostics(
+            controller.switch_history if controller else [], initial_modes,
+            total_opt_steps, trainable_per_update)
+        save_json(diagnostics, paths["dynamic"] / "switch_diagnostics.json")
 
-    if controller is not None:
-        save_json(
-            {"switch_history": controller.switch_history},
-            paths["dynamic"] / "switch_history.json",
-        )
-        save_json(
-            {"layer_timeline": layer_timeline},
-            paths["dynamic"] / "layer_timeline.json",
-        )
-
-    # ─── Save checkpoint if requested ────────────────────────────────────────
-    if cfg.save_model:
-        save_dir = paths["checkpoints"] / "final_model"
-        save_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            model.save_pretrained(save_dir)
-            tokenizer.save_pretrained(save_dir)
-            print(f"[checkpoint] Saved to {save_dir}")
-        except Exception as e:
-            print(f"[checkpoint] Save failed: {e}")
-
+    mem = {}
+    if device.type == "cuda":
+        mem = {"peak_vram_allocated_gib": torch.cuda.max_memory_allocated(device) / 2**30,
+               "peak_vram_reserved_gib": torch.cuda.max_memory_reserved(device) / 2**30}
     stats = {
         "train_time_sec": train_time,
-        "peak_vram_gb": peak_vram_gb,
+        **mem,
         "total_opt_steps": opt_step,
         "final_trainable_params": param_log[-1]["trainable_params"],
+        "avg_trainable_params_step_weighted": sum(trainable_per_update) / len(trainable_per_update),
         "total_params": total_params,
-        "n_switches": len(controller.switch_history) if controller else 0,
+        "n_switch_events": len(controller.switch_history) if controller else 0,
+        "n_switch_events_with_transitions": sum(1 for h in controller.switch_history if h["n_transitions"])
+        if controller else 0,
+        "switch_overhead_sec": switch_overhead,
+        "branch_step": controller.branch_step if controller else None,
+        "first_promotion_step": first_promotion_step,
+        "post_promotion_optimizer_steps": len(post) if first_promotion_step is not None else None,
+        "post_promotion_mean_step_sec": (sum(post) / len(post)) if post else None,
+        "mean_step_sec": sum(e["step_sec"] for e in loss_log) / len(loss_log),
+        "base_update_changed_fraction_mean": (sum(e["changed_fraction"] for e in probe_log) / len(probe_log))
+        if probe_log else None,
+        "dtype_census": dtype_census,
+        "final_loss": loss_log[-1]["loss"],
     }
     return model, stats
 
@@ -739,8 +733,11 @@ def _relevant_config_fields(cfg: RunConfig) -> dict:
     hyperparameters. Fields that don't apply are set to None, so grouped
     summary tables don't mislead reviewers (e.g., 'lora_r' on a full_ft row).
     """
-    # Always relevant
-    row = {
+    lora_methods = {"lora", "dora", "adalora", "loraga", "automode", "dyn_full_only",
+                    "select_once", "fixed_mixed"}
+    dynamic_methods = {"automode", "dyn_full_only", "select_once"}
+    m = cfg.method
+    return {
         "model_name": cfg.model_name,
         "method": cfg.method,
         "train_track": cfg.train_track,
@@ -749,105 +746,79 @@ def _relevant_config_fields(cfg: RunConfig) -> dict:
         "learning_rate": cfg.learning_rate,
         "train_batch_size": cfg.train_batch_size,
         "grad_accum_steps": cfg.grad_accum_steps,
+        "protocol_version": cfg.protocol_version,
+        "lora_r": cfg.lora_r if m in lora_methods else None,
+        "lora_alpha": cfg.lora_alpha if m in lora_methods else None,
+        "lora_target_modules": ",".join(cfg.lora_target_modules),
+        "dynamic_updates": cfg.dynamic_updates if m in dynamic_methods else None,
+        "dynamic_threshold": cfg.dynamic_threshold if m in dynamic_methods else None,
+        "importance_signal": cfg.importance_signal if m in dynamic_methods else None,
+        "score_collection": cfg.score_collection if m in dynamic_methods else None,
+        "fixed_base_layers": cfg.fixed_base_layers if m == "fixed_mixed" else None,
+        "allocation_seed": cfg.allocation_seed if m == "fixed_mixed" else None,
+        "topk_k": cfg.topk_k if m == "topk_static" else None,
+        "deep_block_start": cfg.deep_block_start if m == "topk_deep_block" else None,
+        "deep_block_end": cfg.deep_block_end if m == "topk_deep_block" else None,
     }
-    # Method-specific fields: only include when relevant
-    m = cfg.method
-    row["lora_r"] = cfg.lora_r if m in {"lora", "dora", "adalora", "loraga",
-                                         "automode", "dyn_full_only"} else None
-    row["lora_alpha"] = cfg.lora_alpha if m in {"lora", "dora", "adalora", "loraga",
-                                                 "automode", "dyn_full_only"} else None
-    row["lora_target_modules"] = (",".join(cfg.lora_target_modules)
-                                   if m in {"lora", "dora", "adalora", "loraga",
-                                            "automode", "dyn_full_only"} else None)
-    row["dynamic_updates"] = cfg.dynamic_updates if m in {"automode", "dyn_full_only"} else None
-    row["dynamic_threshold"] = cfg.dynamic_threshold if m in {"automode", "dyn_full_only"} else None
-    row["importance_signal"] = cfg.importance_signal if m in {"automode", "dyn_full_only"} else None
-    row["topk_k"] = cfg.topk_k if m == "topk_static" else None
-    row["deep_block_start"] = cfg.deep_block_start if m == "topk_deep_block" else None
-    row["deep_block_end"] = cfg.deep_block_end if m == "topk_deep_block" else None
-    row["adalora_init_r"] = cfg.adalora_init_r if m == "adalora" else None
-    row["adalora_target_r"] = cfg.adalora_target_r if m == "adalora" else None
-    row["lisa_num_layers"] = cfg.lisa_num_layers if m == "lisa" else None
-    row["lisa_period"] = cfg.lisa_period if m == "lisa" else None
-    row["adagrad_pct"] = cfg.adagrad_pct if m == "adagradselect" else None
-    return row
 
 
 def run_experiment(cfg: RunConfig) -> Dict[str, Any]:
     """
-    End-to-end single run: build, train, evaluate, log, return result row.
-
-    This is the main entry point the grid runner calls for each config.
+    Legacy grid entry point: build, train, evaluate, export, return result row.
+    Any failure (including evaluation or export) returns a failed row and
+    never writes COMPLETE. The rebuttal campaign uses automode.rebuttal instead.
     """
-    # Import here to avoid circular imports
     from automode.models import build_model_for_method, get_tokenizer
     from automode.data import build_train_dataloader
     from automode.eval import run_evals
+    from automode.export import export_full_inference_model
 
     paths = ensure_dirs(cfg)
-
-    # Resume check
     if is_run_complete(cfg):
-        print(f"[skip] run {cfg.run_id()} already complete.")
+        print(f"[skip] run {cfg.run_id()} already complete (verified identity).")
         return load_json(paths["run"] / "COMPLETE")
 
-    # Save config immediately so we have a record even if training crashes
     save_json(cfg.to_dict(), paths["configs"] / "run_config.json")
-
     set_seed(cfg.seed)
     cleanup_memory()
-
+    from automode.config import METHOD_FIDELITY
+    base_row = {
+        "run_id": cfg.run_id(),
+        "variant": cfg.variant_label(),
+        "paper_fidelity": METHOD_FIDELITY.get(cfg.method, "unknown"),
+        **_relevant_config_fields(cfg),
+    }
     try:
-        tokenizer = get_tokenizer(cfg.model_name)
+        tokenizer = get_tokenizer(cfg.model_name, cfg.model_revision)
         train_loader = build_train_dataloader(cfg, tokenizer)
         model = build_model_for_method(cfg, tokenizer=tokenizer, train_loader=train_loader)
-
-        # Belt-and-suspenders freeze (in case the method builder didn't)
-        if cfg.method in ("automode", "dyn_full_only", "lora", "dora",
-                         "adalora", "loraga"):
+        if cfg.method == "dora":  # other PEFT builders already freeze non-layer params
             freeze_non_layer_params(model)
-
-        print(f"\n{'=' * 80}")
-        print(f"[run] {cfg.run_id()} | method={cfg.method} | model={cfg.model_name}")
-        print(f"      track={cfg.train_track} | seed={cfg.seed} | epochs={cfg.epochs}")
-        trainable, total = count_trainable_params(model)
-        print(f"      trainable={trainable:,} / total={total:,} ({100*trainable/total:.3f}%)")
-        print(f"{'=' * 80}\n")
-
         model, train_stats = train_one_run(cfg, model, train_loader, tokenizer, paths)
         eval_results = run_evals(cfg, model, tokenizer, paths)
-
-        # Import locally to avoid circular dependency at module load
-        from automode.config import METHOD_FIDELITY
-
+        if not eval_results:
+            raise RuntimeError("No evaluation produced results; refusing to mark complete")
+        export_stats = {}
+        if cfg.save_model:
+            export_stats = export_full_inference_model(
+                model, tokenizer, paths["run"] / "export", cfg, {"run_id": cfg.run_id()})
         result = {
-            "run_id": cfg.run_id(),
-            "method": cfg.method,
-            "variant": cfg.variant_label(),
-            "paper_fidelity": METHOD_FIDELITY.get(cfg.method, "unknown"),
+            **base_row,
             "status": "ok",
-            **_relevant_config_fields(cfg),
             **train_stats,
+            "data_stats": getattr(train_loader, "data_stats", None),
             **{f"eval_{k}": v for k, v in eval_results.items()},
-            "config": cfg.to_dict(),  # full config for reproducibility
+            "export": export_stats or None,
+            "config": cfg.to_dict(),
+            "scientific_config": cfg.scientific_dict(),
         }
         mark_run_complete(cfg, result)
         del model
         cleanup_memory()
         return result
-
     except Exception as e:
         import traceback
-        from automode.config import METHOD_FIDELITY
         print(f"[ERROR] run {cfg.run_id()} failed: {e}")
         traceback.print_exc()
         cleanup_memory()
-        return {
-            "run_id": cfg.run_id(),
-            "method": cfg.method,
-            "variant": cfg.variant_label(),
-            "paper_fidelity": METHOD_FIDELITY.get(cfg.method, "unknown"),
-            "status": f"failed: {repr(e)}",
-            **_relevant_config_fields(cfg),
-            "config": cfg.to_dict(),
-        }
+        return {**base_row, "status": f"failed: {repr(e)}", "config": cfg.to_dict()}

@@ -16,7 +16,11 @@ Method builders in this file:
   - apply_dyn_full_only     (same as automode — method string switches behavior in controller)
   - apply_lisa              (injects nothing, full-param — controller samples layers)
   - apply_adagradselect     (same as lisa)
-  - apply_loraga            (gradient-aligned LoRA init)
+  - apply_loraga            (gradient-aligned LoRA init; UNAVAILABLE, see config)
+  - apply_fixed_mixed       (rebuttal control: fixed random q/v base layers + LoRA rest)
+  - apply_static_qv         (rebuttal control: q/v base weights of every layer)
+  select_once uses apply_automode; the controller freezes the allocation after
+  its first scheduled selection.
 """
 
 from __future__ import annotations
@@ -32,12 +36,19 @@ from peft import (
     TaskType,
 )
 
-from automode.config import RunConfig
+import torch.nn as nn
+
+from automode.config import RunConfig, UNAVAILABLE_METHODS
 from automode.core import (
     get_transformer_layers,
     freeze_non_layer_params,
     count_trainable_params,
     identify_layer_for_param,
+    identify_layer_for_module,
+    group_lora_modules_by_layer,
+    fixed_layer_allocation,
+    promote_to_fft,
+    current_layer_mode,
 )
 from automode.train import DTYPE_MAP
 
@@ -46,12 +57,31 @@ from automode.train import DTYPE_MAP
 # Tokenizer
 # ──────────────────────────────────────────────────────────────────────────────
 
-def get_tokenizer(model_name: str):
-    tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+def get_tokenizer(model_name: str, revision: Optional[str] = None):
+    tok = AutoTokenizer.from_pretrained(model_name, revision=revision, use_fast=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
-    tok.padding_side = "right"  # right for training; we flip to left for eval
+    if tok.eos_token_id is None or tok.pad_token_id is None:
+        raise RuntimeError("Tokenizer needs eos and pad tokens")
+    tok.padding_side = "right"  # collators pad explicitly; this is only a default
     return tok
+
+
+# Methods whose q/v BASE weights may receive optimizer updates.
+BASE_TRAINING_METHODS = ("automode", "select_once", "fixed_mixed", "static_qv")
+
+
+def upcast_target_base_weights(model, target_modules) -> int:
+    """Keep q/v base weights in fp32 (cfg.base_weight_dtype='float32')."""
+    n = 0
+    for name, module in model.named_modules():
+        if (isinstance(module, nn.Linear) and name.split(".")[-1] in target_modules
+                and identify_layer_for_module(name) is not None):
+            module.weight.data = module.weight.data.float()
+            n += 1
+    if n == 0:
+        raise RuntimeError(f"No target modules {target_modules} found to upcast")
+    return n
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -75,6 +105,8 @@ def load_base_model(cfg: RunConfig):
         torch_dtype=dtype,
         device_map={"": device},
         low_cpu_mem_usage=cfg.low_cpu_mem_usage,
+        revision=cfg.model_revision,
+        attn_implementation=cfg.attn_implementation,
     )
     model = AutoModelForCausalLM.from_pretrained(cfg.model_name, **kwargs)
 
@@ -84,10 +116,7 @@ def load_base_model(cfg: RunConfig):
     if cfg.gradient_checkpointing:
         model.gradient_checkpointing_enable()
         # Required so gradients flow through frozen leading layers
-        try:
-            model.enable_input_require_grads()
-        except Exception:
-            pass
+        model.enable_input_require_grads()
 
     return model
 
@@ -109,8 +138,11 @@ def apply_lora(model, cfg: RunConfig):
         target_modules=list(cfg.lora_target_modules),
         bias="none",
         task_type=TaskType.CAUSAL_LM,
+        init_lora_weights=True,  # A ~ U(-1/sqrt(d_in), 1/sqrt(d_in)), B = 0
     )
-    return get_peft_model(model, peft_cfg)
+    model = get_peft_model(model, peft_cfg)
+    freeze_non_layer_params(model)
+    return model
 
 
 def apply_dora(model, cfg: RunConfig):
@@ -240,6 +272,48 @@ def apply_automode(model, cfg: RunConfig):
     return model
 
 
+def apply_fixed_mixed(model, cfg: RunConfig):
+    """
+    Rebuttal control: from step 0, a fixed set of cfg.fixed_base_layers layers
+    (chosen by stdlib random with cfg.allocation_seed, never by loss or test
+    data) trains its q/v BASE weights; every other layer trains q/v LoRA with
+    the AutoMode adapter config. The zero-delta adapters of the base layers are
+    merged once (adding exactly zero) so promote/export bookkeeping is uniform.
+    The chosen layer IDs are stored on model.automode_allocation.
+    """
+    model = apply_automode(model, cfg)
+    groups = group_lora_modules_by_layer(model)
+    order = sorted(groups, key=lambda s: int(s.split("_")[1]))
+    chosen = fixed_layer_allocation(len(order), cfg.fixed_base_layers, cfg.allocation_seed)
+    for i in chosen:
+        promote_to_fft(groups[order[i]])
+    model.automode_allocation = {
+        "base_layer_indices": chosen, "allocation_seed": cfg.allocation_seed,
+        "n_layers": len(order), "n_base": len(chosen),
+    }
+    model.automode_layer_modes = {lid: current_layer_mode(groups[lid]) for lid in order}
+    return model
+
+
+def apply_static_qv(model, cfg: RunConfig):
+    """Rebuttal control: q/v base weights of every layer train; nothing else."""
+    for p in model.parameters():
+        p.requires_grad = False
+    n_layers = len(get_transformer_layers(model))
+    found = set()
+    for name, module in model.named_modules():
+        lid = identify_layer_for_module(name)
+        if lid is not None and name.split(".")[-1] in cfg.lora_target_modules:
+            for p in module.parameters():
+                p.requires_grad = True
+            found.add((lid, name.split(".")[-1]))
+    if len(found) != n_layers * len(cfg.lora_target_modules):
+        raise RuntimeError(f"static_qv found {len(found)} target modules, expected "
+                           f"{n_layers * len(cfg.lora_target_modules)}")
+    model.automode_layer_modes = {f"layer_{i}": "full_ft" for i in range(n_layers)}
+    return model
+
+
 def apply_dyn_full_only(model, cfg: RunConfig):
     """
     Ablation: same as AutoMode, but non-selected layers are FROZEN (not LoRA).
@@ -267,16 +341,13 @@ def apply_loraga(model, cfg: RunConfig, train_loader):
     LoRA-GA: gradient-aligned LoRA init. Requires a few-step gradient estimation
     pass before get_peft_model(). Uses the custom LoRA-GA PEFT fork.
 
-    If the fork isn't installed, falls back to standard LoRA with a warning.
+    UNAVAILABLE: earlier versions silently fell back to plain LoRA when the fork
+    was missing. It now raises ImportError instead of substituting a method.
     """
-    try:
-        from peft import LoraGAConfig, get_peft_model as _gpm
-        from peft.utils.lora_ga_utils import (
-            estimate_gradient, LoraGAContext,
-        )
-    except ImportError:
-        print("[loraga] LoRA-GA fork not installed; falling back to standard LoRA.")
-        return apply_lora(model, cfg)
+    from peft import LoraGAConfig, get_peft_model as _gpm
+    from peft.utils.lora_ga_utils import (
+        estimate_gradient, LoraGAContext,
+    )
 
     from itertools import islice
     device = cfg.device
@@ -325,7 +396,19 @@ def build_model_for_method(cfg: RunConfig, tokenizer=None, train_loader=None):
     """
     Load base + apply the method. This is the single entry point train.py calls.
     """
-    model = load_base_model(cfg)
+    if cfg.method in UNAVAILABLE_METHODS:
+        raise NotImplementedError(
+            f"Method {cfg.method!r} is unavailable until revalidated: {UNAVAILABLE_METHODS[cfg.method]}")
+    return apply_method(load_base_model(cfg), cfg, train_loader)
+
+
+def apply_method(model, cfg: RunConfig, train_loader=None):
+    """Apply cfg.method to an already-loaded causal LM (also used by CPU tests)."""
+    if cfg.method in UNAVAILABLE_METHODS:
+        raise NotImplementedError(
+            f"Method {cfg.method!r} is unavailable until revalidated: {UNAVAILABLE_METHODS[cfg.method]}")
+    if cfg.base_weight_dtype == "float32" and cfg.method in BASE_TRAINING_METHODS:
+        upcast_target_base_weights(model, cfg.lora_target_modules)
 
     # Most methods just apply and return
     dispatch_simple = {
@@ -336,6 +419,9 @@ def build_model_for_method(cfg: RunConfig, tokenizer=None, train_loader=None):
         "topk_static":      lambda m: apply_topk_static(m, cfg),
         "topk_deep_block":  lambda m: apply_topk_deep_block(m, cfg),
         "automode":         lambda m: apply_automode(m, cfg),
+        "select_once":      lambda m: apply_automode(m, cfg),
+        "fixed_mixed":      lambda m: apply_fixed_mixed(m, cfg),
+        "static_qv":        lambda m: apply_static_qv(m, cfg),
         "dyn_full_only":    lambda m: apply_dyn_full_only(m, cfg),
         "lisa":             lambda m: apply_lisa(m, cfg),
         "adagradselect":    lambda m: apply_adagradselect(m, cfg),
