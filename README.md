@@ -95,7 +95,7 @@ Everything is driven from your laptop by `notebooks/AutoMode_Four_GPU_Colab.ipyn
 **Afterwards**
 
 16. Run **§10** to download logs, predictions and reports (you can also do this mid-run). Run **§11** to validate the downloads and summarize them.
-17. Copy the full exports (seed-8 jobs, `core/<job>/attempts/<n>/export/`) off workers 0 and 3. The download does not include weights.
+17. Copy the full exports (seed-8 jobs, `core/<job>/attempts/<n>/export/`, including `adapter/` and `layer_state.json`) off workers 0 and 3. The download does not include weights.
 18. Analyse with `notebooks/figures.ipynb`, pointed at the download.
 19. Only then release the rentals through the provider. Stopping jobs (§12) does not stop billing.
 
@@ -132,7 +132,7 @@ python -m automode.rebuttal run       --manifest FILE --worker-id N --output DIR
 
 **Stop.** Run the notebook's stop cell, or `python3 WORKER_ROOT/remote_job.py stop --job-dir WORKER_ROOT/jobs/core`. On SIGTERM the runner forwards the signal to the job, which records `interrupted` and writes no success marker; the ledger records the interruption. Stopping a job does not stop rental billing.
 
-**Export.** Jobs with `save_model: true` (all seed-8 jobs) write a **full inference export** to `core/<job>/attempts/<n>/export/`. This happens after all evaluation. Adapters that are not yet merged are merged once, the LoRA wrappers are removed, and the full model, tokenizer and config are saved. The export is then reloaded and its logits are compared with the live model on fixed prompts (`export_metadata.json`). It is **not** a resumable training checkpoint. The notebook's download excludes weights; copy exports off the workers before releasing them.
+**Export.** Jobs with `save_model: true` (all seed-8 jobs) write a **full inference export** to `core/<job>/attempts/<n>/export/`. This happens after all evaluation. PEFT models are saved **unmerged**: the learned base as a normal HF checkpoint, every adapter in `adapter/`, and each layer's merged state in `layer_state.json`. Load them with `automode.export.load_unmerged_export(export_dir, device)`. Loading the root alone gives the base without the unmerged adapters. `static_qv` has no adapters and is a plain checkpoint. The export is reloaded and its logits are compared with the live model on fixed prompts (`export_metadata.json`, `checks.reload_vs_live`, limit 1e-4). A merge is then audited on the live model and reported separately (`checks.merge_vs_live`, `merge_audit`); it is never saved. It is **not** a resumable training checkpoint. The notebook's download excludes weights; copy exports off the workers before releasing them.
 
 **Disk.** Gemma-2-9B bf16 weights are ~18.5 GB, and each full export is about the same size. Preflight measures the snapshot and requires at least `(exports + 1) × snapshot + 10 GiB` free after download. With ~17.2 GiB of weights, that is ≈ 96 GiB for worker 0 (4 exports), ≈ 44 GiB for worker 3 (1 export) and ≈ 27 GiB for workers 1–2, on top of the ~17 GiB HF cache. Provision ~200 GB per worker, as the kit recommends.
 
@@ -150,7 +150,7 @@ core/<job_id>/attempts/attempt_NNN/
   logs/{training_loss,lr_schedule,grad_norms,trainable_params,base_update_probe}.json   (flushed during training)
   dynamic/{switch_history,layer_timeline,switch_diagnostics,allocation}.json
   evals/gsm8k_eval.json                     every sample, extraction, vote, gold, item_id
-  export/                                   full inference export + export_metadata.json (seed-8 jobs)
+  export/                                   full inference export: base, adapter/, layer_state.json, export_metadata.json (seed-8 jobs)
 ```
 
 `switch_diagnostics.json` gives:

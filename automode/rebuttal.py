@@ -28,6 +28,7 @@ are not verified complete (that re-invocation is the explicit retry).
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import datetime as _dt
 import fcntl
 import hashlib
@@ -55,6 +56,7 @@ PILOT_TRAIN_SAMPLES = 512
 PILOT_EVAL_SAMPLES = 100
 PILOT_DYNAMIC_UPDATES = 2
 MIN_POST_PROMOTION_STEPS = 5
+EXPORT_DIAGNOSTIC_PROMPTS = 32
 ETA_SAFETY_FACTOR = 1.25
 GIB = 2 ** 30
 
@@ -508,7 +510,7 @@ def run_single_job(spec: dict) -> int:
                 {"job_id": spec["job_id"], "identity": spec["identity"], "commit": spec["source"]["commit"],
                  "dataset_revision": cfg.dataset_revision})
             if spec.get("delete_export_weights"):
-                for f in (attempt / "export").glob("*.safetensors"):
+                for f in (attempt / "export").rglob("*.safetensors"):
                     f.unlink()
                 export["weights_deleted_after_verification"] = True
         del model
@@ -567,6 +569,10 @@ def verify_completed(job_dir: Path, identity: str, require_export: bool, expecte
             meta = read_json(attempt / "export" / "export_metadata.json")
             if meta.get("status") != "ok" or not list((attempt / "export").glob("*.safetensors")):
                 return False, "requested full export missing or unverified"
+            if meta.get("kind") == "full_unmerged_inference_export" and not (
+                    (attempt / "export" / "layer_state.json").exists()
+                    and (attempt / "export" / "adapter" / "adapter_model.safetensors").exists()):
+                return False, "unmerged export is missing its adapters or layer state"
         return True, "verified"
     except (OSError, KeyError, ValueError, TypeError) as e:
         return False, f"verification error: {type(e).__name__}: {e}"
@@ -839,6 +845,7 @@ def _pilot(args, manifest, msha, src, out, report) -> dict:
             generation_tokens_per_sec=r["metrics"]["gsm8k_generated_tokens"] / r["metrics"]["gsm8k_eval_time_sec"],
             base_update_changed_fraction_mean=t["base_update_changed_fraction_mean"],
             dtype_census=t["dtype_census"], method_checks=checks,
+            export_kind=(r["export"] or {}).get("kind"), export_checks=(r["export"] or {}).get("checks"),
             pilot_metric_not_a_result=r[r["metric_key"]],
             model_revision=revisions["model_revision"], dataset_revision=revisions["dataset_revision"],
             assumptions=[
@@ -975,11 +982,64 @@ def cmd_job(args) -> int:
     return run_single_job(read_json(Path(args.spec)))
 
 
+def cmd_export_diagnostic(args) -> int:
+    return _reported_phase(args, "export_diagnostic_report.json", lambda *a: _export_diagnostic(args, *a))
+
+
+def _export_diagnostic(args, manifest, msha, src, out, report) -> dict:
+    """Train the AutoMode pilot configuration, skip evaluation, and measure the
+    merge. Prompts come from the GSM8K train split, never the test set."""
+    from automode.data import make_train_dataloader, tokenize_examples, encode_prompt
+    from automode.export import base_update_assessment, export_diagnostic
+    from automode.models import apply_method
+    from automode.train import set_seed, train_one_run
+
+    with file_lock(out / ".worker.lock", f"worker {args.worker_id} output"):
+        _require_report(out, "preflight_report.json", src, args.worker_id)
+        revisions = _resolved(out, msha)
+        job = next(j for j in worker_jobs(manifest, args.worker_id) if j["overrides"]["method"] == "automode")
+        cfg = pilot_config(manifest, job, revisions, save_model=True)
+        attempt = next_attempt_dir(out / "diagnostics" / "export")
+        paths = {k: attempt / k for k in ("configs", "logs", "dynamic", "evals")}
+        for p in paths.values():
+            p.mkdir(parents=True, exist_ok=True)
+        paths["run"] = attempt
+
+        tokenizer = _load_tokenizer(cfg)
+        dataset = _load_train_dataset(cfg)
+        features, data_stats = tokenize_examples(dataset, tokenizer, cfg)
+        loader = make_train_dataloader(features, data_stats, tokenizer, cfg)
+        base = _load_base_model(cfg)
+        set_seed(cfg.seed)
+        model = apply_method(base, cfg)
+        model, train_stats = train_one_run(cfg, model, loader, tokenizer, paths)
+
+        # Train-split rows this pilot did not train on, taken from the end of the split.
+        trained_on = {dataset[i]["prompt"] for i in range(len(dataset))}
+        full = _load_train_dataset(dataclasses.replace(cfg, max_train_samples=None))
+        unseen = [full[i]["prompt"] for i in reversed(range(len(full))) if full[i]["prompt"] not in trained_on]
+        prompts = [encode_prompt(tokenizer, p, cfg.max_source_len)[0] for p in unseen[:EXPORT_DIAGNOSTIC_PROMPTS]]
+        probe_log = read_json(paths["logs"] / "base_update_probe.json")["base_update_probe"]
+        batch = next(iter(make_train_dataloader(features, data_stats, tokenizer, cfg)))  # sampler is single-use
+        assessment = base_update_assessment(model, batch, probe_log, cfg)
+        try:
+            diagnostic = export_diagnostic(model, tokenizer, prompts, attempt / "export", cfg,
+                                           {"job_id": job["job_id"], "commit": src["commit"]})
+        finally:
+            for f in (attempt / "export").rglob("*.safetensors"):
+                f.unlink()
+        diagnostic.update(base_update_assessment=assessment, train=train_stats, attempt=str(attempt))
+        write_json_atomic(attempt / "export_diagnostic.json", diagnostic)
+        if "export_error" in diagnostic:
+            raise RebuttalError(f"{diagnostic['export_error']} (details: {attempt / 'export_diagnostic.json'})")
+        return diagnostic
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(prog="python -m automode.rebuttal")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("contract")
-    for name in ("preflight", "pilot", "run"):
+    for name in ("preflight", "pilot", "run", "export-diagnostic"):
         sp = sub.add_parser(name)
         sp.add_argument("--manifest", required=True, type=Path)
         sp.add_argument("--worker-id", required=True, type=int, choices=range(N_WORKERS))
@@ -990,7 +1050,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     sj.add_argument("--spec", required=True)
     args = p.parse_args(argv)
     handler = {"contract": cmd_contract, "preflight": cmd_preflight, "pilot": cmd_pilot,
-               "run": cmd_run, "_job": cmd_job}[args.cmd]
+               "run": cmd_run, "export-diagnostic": cmd_export_diagnostic, "_job": cmd_job}[args.cmd]
     try:
         return handler(args)
     except RebuttalError as e:

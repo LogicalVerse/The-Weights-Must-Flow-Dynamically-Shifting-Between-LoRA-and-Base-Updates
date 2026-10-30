@@ -43,6 +43,7 @@ from automode.eval import (  # noqa: E402
 )
 from automode.models import apply_method  # noqa: E402
 from automode.train import train_one_run  # noqa: E402
+from peft.tuners.lora import LoraLayer  # noqa: E402
 
 DEVICE = torch.device(os.environ.get("AUTOMODE_TEST_DEVICE", "cpu"))
 MANIFEST = REPO / "configs" / "rebuttal_core.json"
@@ -72,7 +73,10 @@ def tiny_gemma(n_layers=4, seed=0, dtype=torch.float32):
                        num_attention_heads=2, num_key_value_heads=1, head_dim=16, max_position_embeddings=512,
                        sliding_window=256, pad_token_id=0, eos_token_id=1, bos_token_id=2,
                        attn_implementation="eager")
-    model = Gemma2ForCausalLM(cfg).to(device=DEVICE, dtype=dtype)
+    # Parameters only, as from_pretrained(torch_dtype=...) leaves them: buffers keep their precision.
+    model = Gemma2ForCausalLM(cfg).to(device=DEVICE)
+    for p in model.parameters():
+        p.data = p.data.to(dtype)
     model.config.use_cache = False
     return model
 
@@ -311,7 +315,7 @@ def test_lora_init_is_uniform_kaiming_in_peft_and_on_reset():
 def test_full_export_round_trip_keeps_base_updates_and_adapter_only_save_loses_them(tmp_path):
     from peft import PeftModel
     from transformers import AutoModelForCausalLM
-    from automode.export import export_full_inference_model
+    from automode.export import export_full_inference_model, load_unmerged_export
     tok = tiny_tokenizer()
     tiny_gemma().save_pretrained(tmp_path / "orig_base")  # same seed as _automode_model's base
     cfg, model = _automode_model()
@@ -331,10 +335,187 @@ def test_full_export_round_trip_keeps_base_updates_and_adapter_only_save_loses_t
 
     info = export_full_inference_model(model, tok, tmp_path / "export", cfg, {"run": "test"})
     assert info["status"] == "ok" and info["resumable_training_checkpoint"] is False
-    assert info["n_lora_layers_already_merged"] == 4 and info["n_lora_layers_merged_at_export"] == 4
-    reloaded = AutoModelForCausalLM.from_pretrained(tmp_path / "export").to(DEVICE)
+    assert info["n_lora_layers_already_merged"] == 4 and info["n_lora_layers_unmerged_in_export"] == 4
+    reloaded = load_unmerged_export(tmp_path / "export", DEVICE)
     assert torch.allclose(logits(reloaded, x), live, atol=1e-4)
-    assert json.loads((tmp_path / "export" / "export_metadata.json").read_text())["kind"] == "full_inference_export"
+    meta = json.loads((tmp_path / "export" / "export_metadata.json").read_text())
+    assert meta["kind"] == "full_unmerged_inference_export"
+
+
+def automode_autocast(cfg):
+    from automode.train import autocast_ctx
+    return autocast_ctx(cfg, DEVICE)
+
+
+def _mixed_automode_model(dtype, adapter_std=2e-4):
+    """Every state an AutoMode export can meet, with adapters small next to the base
+    weights like the campaign's: layer_0 merged and base-trained; layer_1 merged,
+    base-trained, demoted, adapter retrained; layer_2 LoRA-trained; layer_3 zero delta."""
+    cfg = make_cfg("automode", dtype={torch.float32: "float32", torch.bfloat16: "bfloat16"}[dtype], lora_dropout=0.0)
+    torch.manual_seed(0)
+    model = apply_method(tiny_gemma(dtype=dtype), cfg)
+    groups = group_lora_modules_by_layer(model)
+
+    def set_adapters(mods):
+        with torch.no_grad():
+            for m in mods:
+                m.lora_B["default"].weight.normal_(0, adapter_std)
+    set_adapters(groups["layer_0"] + groups["layer_1"] + groups["layer_2"])
+    promote_to_fft(groups["layer_0"]); promote_to_fft(groups["layer_1"])
+
+    x = torch.randint(3, 100, (2, 12), device=DEVICE)
+    opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-3)
+    model.train()
+    model(input_ids=x, labels=x)["loss"].backward(); opt.step(); opt.zero_grad(set_to_none=True)
+    demote_to_lora(groups["layer_1"], torch.Generator().manual_seed(1))
+    set_adapters(groups["layer_1"])
+    with torch.no_grad():
+        for m in groups["layer_3"]:
+            m.lora_B["default"].weight.zero_()
+    model.eval()
+    return cfg, model, x
+
+
+def test_unmerged_bf16_export_rebuilds_the_evaluated_model_exactly(tmp_path):
+    from automode.export import export_full_inference_model, load_unmerged_export
+    cfg, model, x = _mixed_automode_model(torch.bfloat16)
+    live = logits(model, x)
+    snapshot = {k: v.clone() for k, v in model.state_dict().items()}
+    state_before = {n: list(m.merged_adapters) for n, m in model.named_modules() if isinstance(m, LoraLayer)}
+
+    info = export_full_inference_model(model, tiny_tokenizer(), tmp_path / "export", cfg, {})
+    assert info["status"] == "ok" and info["checks"]["reload_vs_live"]["max_abs_logit_diff"] <= 1e-4
+
+    reloaded = load_unmerged_export(tmp_path / "export", DEVICE)
+    assert torch.allclose(logits(reloaded, x), live, atol=1e-4)
+    rebuilt = reloaded.state_dict()
+    assert set(rebuilt) == set(snapshot)
+    for k, v in snapshot.items():
+        assert rebuilt[k].dtype == v.dtype and torch.equal(rebuilt[k], v), k  # learned base AND adapters
+    assert {n: list(m.merged_adapters) for n, m in reloaded.named_modules()
+            if isinstance(m, LoraLayer)} == state_before
+    assert info["n_lora_layers_already_merged"] == 2 and info["n_lora_layers_unmerged_in_export"] == 6
+
+    # The formula holds (no raise), yet a bf16 merge cannot keep these deltas.
+    merged_now = [r for r in info["merge_audit"] if r["state"] == "merged_now"]
+    with_delta = [r for r in merged_now if r["delta_error_ratio"] is not None]
+    assert len(merged_now) == 6 and len(with_delta) == 4
+    assert all(r["delta_error_ratio"] > 0.05 and r["unchanged_fraction"] > 0.05 for r in with_delta)
+    assert {"max_total_variation", "max_kl", "mean_kl"} <= set(info["checks"]["merge_vs_live"])
+
+
+@pytest.mark.parametrize("method,kw", [(m, {}) for m in CORE_METHODS] + [("automode", {"base_weight_dtype": "float32"})])
+def test_bf16_export_verifies_for_every_core_method(method, kw, tmp_path):
+    from automode.export import export_full_inference_model
+    cfg = make_cfg(method, dtype="bfloat16", **kw)
+    torch.manual_seed(0)
+    model = apply_method(tiny_gemma(dtype=torch.bfloat16), cfg)
+    x = torch.randint(3, 100, (2, 12), device=DEVICE)
+    opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-3)
+    model.train()
+    with automode_autocast(cfg):
+        model(input_ids=x, labels=x)["loss"].backward()
+    opt.step()
+    info = export_full_inference_model(model, tiny_tokenizer(), tmp_path / "export", cfg, {})
+    assert info["status"] == "ok" and info["checks"]["reload_vs_live"]["max_abs_logit_diff"] <= 1e-4
+    assert info["kind"] == ("full_inference_export" if method == "static_qv" else "full_unmerged_inference_export")
+
+
+def test_same_mixed_states_merge_faithfully_in_fp32(tmp_path):
+    from automode.export import export_full_inference_model
+    cfg, model, x = _mixed_automode_model(torch.float32)
+    info = export_full_inference_model(model, tiny_tokenizer(), tmp_path / "export", cfg, {})
+    assert info["status"] == "ok" and info["merged_model_within_tolerance"] is True
+    assert info["checks"]["merge_vs_live"]["max_abs_logit_diff"] <= 1e-3
+    assert info["checks"]["merge_vs_live"]["top1_agreement"] == 1.0
+    assert all(r["delta_error_ratio"] < 1e-3 for r in info["merge_audit"]
+               if r["state"] == "merged_now" and r["delta_error_ratio"] is not None)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_merge_audit_rejects_a_wrong_merge(dtype, monkeypatch):
+    from peft.tuners.lora import Linear
+    from automode.export import merge_and_audit
+    cfg, model, _ = _mixed_automode_model(dtype, adapter_std=1e-2)
+    real_merge = Linear.merge
+
+    def double_merge(self, *a, **k):
+        delta = self.get_delta_weight("default").detach()
+        real_merge(self, *a, **k)
+        self.get_base_layer().weight.data += delta.to(self.get_base_layer().weight.dtype)
+    monkeypatch.setattr(Linear, "merge", double_merge)
+    with pytest.raises(RuntimeError, match="does not match"):
+        merge_and_audit(model)
+    monkeypatch.setattr(Linear, "merge", real_merge)
+
+    cfg, model, _ = _mixed_automode_model(dtype, adapter_std=1e-2)
+    already = group_lora_modules_by_layer(model)["layer_0"][0].get_base_layer().weight
+
+    def touching_merge(self, *a, **k):
+        real_merge(self, *a, **k)
+        already.data[0, 0] += 1.0
+    monkeypatch.setattr(Linear, "merge", touching_merge)
+    with pytest.raises(RuntimeError, match="Already-merged"):
+        merge_and_audit(model)
+
+
+def test_reload_mismatch_still_fails_and_is_recorded(tmp_path, monkeypatch):
+    import automode.export as export
+    cfg, model, _ = _mixed_automode_model(torch.bfloat16)
+    real_load = export.load_unmerged_export
+
+    def corrupted(out_dir, device):
+        m = real_load(out_dir, device)
+        with torch.no_grad():
+            group_lora_modules_by_layer(m)["layer_3"][0].get_base_layer().weight.mul_(2)
+        return m
+    monkeypatch.setattr(export, "load_unmerged_export", corrupted)
+    with pytest.raises(RuntimeError, match="Export verification failed"):
+        export.export_full_inference_model(model, tiny_tokenizer(), tmp_path / "export", cfg, {})
+    assert json.loads((tmp_path / "export" / "export_metadata.json").read_text())["status"] == "failed"
+
+
+def test_export_diagnostic_measures_counterfactuals_without_test_data(tmp_path, tiny_loaders):
+    from automode.export import base_update_assessment, export_diagnostic
+    cfg, model, _ = _mixed_automode_model(torch.bfloat16)
+    tok = tiny_tokenizer()
+    cfg.max_new_tokens = 8
+    batch = next(iter(tiny_loader(cfg, tok)))
+    assessment = base_update_assessment(model, batch, [{"step": 1, "lr": 2e-5, "changed_fraction": 0.1}], cfg)
+    assert 0.0 <= assessment["per_update"][0]["predicted_if_step_equals_lr"] <= 1.0
+    assert assessment["n_trainable_base_elements"] > 0 and assessment["weight_dtypes"] == ["torch.bfloat16"]
+    assert not any(p.grad is not None for p in model.parameters())
+
+    prompts = [tok(p["prompt"])["input_ids"] for p in TRAIN_EXAMPLES[:3]]
+    report = export_diagnostic(model, tok, prompts, tmp_path / "export", cfg, {"job_id": "t"})
+    assert report["export"]["status"] == "ok"
+    assert report["n_unmerged_projections"] == 6 and len(report["single_projection_merge_vs_live"]) == 6
+    for key in ("exact_merge_vs_live", "adapter_removed_vs_live", "merged_vs_live", "merged_vs_adapter_removed"):
+        assert report[key]["max_abs_logit_diff"] >= 0.0
+    assert 0.0 <= report["greedy_generation"]["identical_text_fraction"] <= 1.0
+
+
+def test_export_diagnostic_command_needs_preflight_then_reports_on_unseen_train_rows(tmp_path, tiny_loaders, monkeypatch):
+    m = json.loads(MANIFEST.read_text())
+    m["common"].update(train_batch_size=2, grad_accum_steps=2, max_source_len=64, max_target_len=16, device=str(DEVICE))
+    monkeypatch.setattr(rebuttal, "_common_context", lambda a: (m, "e" * 64, SRC, tmp_path))
+    monkeypatch.setattr(rebuttal, "_load_train_dataset",
+                        lambda cfg: TRAIN_EXAMPLES[:8] if cfg.max_train_samples else TRAIN_EXAMPLES)
+    monkeypatch.setattr(rebuttal, "_load_gsm8k_test", lambda cfg: pytest.fail("the diagnostic must not read test data"))
+    args = rebuttal.argparse.Namespace(worker_id=0, output=tmp_path)
+    assert rebuttal.cmd_export_diagnostic(args) == 1
+    report_path = tmp_path / "export_diagnostic_report.json"
+    assert "preflight_report.json missing" in json.loads(report_path.read_text())["error"]
+
+    (tmp_path / "preflight_report.json").write_text(json.dumps({"status": "ok", "worker_id": 0, **SRC}))
+    (tmp_path / "resolved_manifest.json").write_text(json.dumps(
+        {"manifest_sha256": "e" * 64, "revisions": {"model_revision": "r", "dataset_revision": "d"}}))
+    assert rebuttal.cmd_export_diagnostic(args) == 0
+    report = json.loads(report_path.read_text())
+    assert report["status"] == "ok" and report["export"]["status"] == "ok"
+    assert report["n_diagnostic_prompts"] == 5  # the rows the pilot config did not train on
+    assert "base_update_assessment" in report and "greedy_generation" in report
+    assert not list(Path(report["attempt"]).rglob("*.safetensors"))  # weights are not kept
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -764,6 +945,11 @@ def test_end_to_end_tiny_core_job_with_verified_export(method, tmp_path, tiny_lo
     res = json.loads((Path(spec["attempt_dir"]) / "result.json").read_text())
     assert res["eval_gsm8k_n_total"] == 3 and 0 <= res["eval_gsm8k_maj3"] <= 1
     assert res["export"]["status"] == "ok" and res["train"]["total_opt_steps"] == 8
+    if method != "static_qv":
+        adapter = Path(spec["attempt_dir"]) / "export" / "adapter" / "adapter_model.safetensors"
+        adapter.rename(adapter.with_suffix(".moved"))
+        assert not rebuttal.verify_completed(job_dir, spec["identity"], True, 3)[0]
+        adapter.with_suffix(".moved").rename(adapter)
     diag = Path(spec["attempt_dir"]) / "dynamic" / "switch_diagnostics.json"
     assert diag.exists() == (method != "lora")
     assert not rebuttal.verify_completed(job_dir, "other-identity", True, 3)[0]

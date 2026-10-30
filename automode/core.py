@@ -26,9 +26,10 @@ Bugs this module explicitly avoids:
    clears PEFT's merged bookkeeping, and re-initialises the adapter to the same
    distribution PEFT uses at creation: A ~ Uniform(-1/sqrt(d_in), 1/sqrt(d_in))
    (kaiming_uniform_, a=sqrt(5)), B = 0, so B@A = 0. This is NOT Gaussian.
-   Eval-mode function is preserved across promote/demote; training-mode
-   behaviour is not identical, because LoRA dropout acts only on the adapter
-   path, which is absent in base mode.
+   Eval-mode function is preserved across promote/demote up to the precision of
+   the merge: exact in fp32, but a bf16 base rounds W + delta to its grid, so part
+   of the delta is lost. Training-mode behaviour is not identical, because LoRA
+   dropout acts only on the adapter path, which is absent in base mode.
 
 5. lm_head / embed_tokens incorrectly trainable — freeze_non_layer_params()
    explicitly freezes them after PEFT wrapping.
