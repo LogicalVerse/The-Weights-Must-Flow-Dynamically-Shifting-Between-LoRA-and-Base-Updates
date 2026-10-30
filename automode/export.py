@@ -47,11 +47,21 @@ def export_tolerances(dtype: str) -> Dict[str, float]:
 @torch.no_grad()
 def _probe_logits(model, ids_list, cfg) -> List[torch.Tensor]:
     from automode.train import autocast_ctx
+
+    model.eval()
     device = next(model.parameters()).device
     out = []
+
     with autocast_ctx(cfg, device):
         for ids in ids_list:
-            out.append(model(input_ids=torch.tensor([ids], device=device))["logits"].float().cpu())
+            logits = model(
+                input_ids=torch.tensor(
+                    [ids], dtype=torch.long, device=device
+                ),
+                use_cache=False,
+            )["logits"]
+            out.append(logits.float().cpu())
+
     return out
 
 
@@ -91,7 +101,12 @@ def export_full_inference_model(model, tokenizer, out_dir: Path, cfg, metadata: 
         base = model.unload()
     else:
         base = model
-    base = base.to(DTYPE_MAP[cfg.dtype])
+    # Cast exported weights without rounding internal buffers.
+    with torch.no_grad():
+        for parameter in base.parameters():
+            if parameter.is_floating_point():
+                parameter.data = parameter.data.to(DTYPE_MAP[cfg.dtype])
+    base.eval()
     base.config.use_cache = True
     merged = _probe_logits(base, probe_ids, cfg)
 
